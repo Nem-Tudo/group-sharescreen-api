@@ -36,14 +36,15 @@ async function main() {
   await initModerationStore();
 
   // @fastify/cors defaults to methods: "GET,HEAD,POST" — without listing
-  // DELETE explicitly here, the browser's preflight for
-  // DELETE /admin/announcement (clearing an announcement) gets back an
-  // Access-Control-Allow-Methods that doesn't include DELETE, so it blocks
+  // DELETE and PUT explicitly here, the browser's preflight for
+  // DELETE /admin/announcement (clearing an announcement) or
+  // PUT /admin/banned-words (saving the chat filter) gets back an
+  // Access-Control-Allow-Methods that doesn't include them, so it blocks
   // the real request client-side with a CORS error before it ever reaches
   // this server.
   await app.register(cors, {
     origin: true,
-    methods: ["GET", "HEAD", "POST", "DELETE"],
+    methods: ["GET", "HEAD", "POST", "PUT", "DELETE"],
     allowedHeaders: "*",
     exposedHeaders: "*",
   });
