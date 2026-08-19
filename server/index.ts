@@ -14,6 +14,8 @@ const HOST = process.env.HOST || "0.0.0.0";
 // shouldn't be world-readable on an unauthenticated endpoint.
 const METRICS_TOKEN = process.env.METRICS_TOKEN || null;
 
+const CURRENT_ID = randomUUID()
+
 async function main() {
   const app = Fastify({ logger: true });
 
@@ -23,12 +25,17 @@ async function main() {
   // Access-Control-Allow-Methods that doesn't include DELETE, so it blocks
   // the real request client-side with a CORS error before it ever reaches
   // this server.
-  await app.register(cors, { origin: true, methods: ["GET", "HEAD", "POST", "DELETE"] });
+  await app.register(cors, {
+    origin: true,
+    methods: ["GET", "HEAD", "POST", "DELETE"],
+    allowedHeaders: "*",
+    exposedHeaders: "*",
+  });
   await app.register(websocketPlugin, {
     options: { maxPayload: 64 * 1024 },
   });
 
-  app.get("/health", async () => ({ ok: true }));
+  app.get("/health", async () => ({ ok: true, CURRENT_ID }));
 
   app.get("/metrics", async (request, reply) => {
     if (METRICS_TOKEN) {

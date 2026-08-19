@@ -6,7 +6,9 @@ export interface ChatMessage {
   id: string;
   from: string;
   name: string;
+  kind?: "text" | "gif";
   text: string;
+  url?: string;
   ts: number;
 }
 
