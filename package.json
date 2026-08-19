@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "start": "tsx server/index.ts"
+    "start": "exec tsx server/index.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",
