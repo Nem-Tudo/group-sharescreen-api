@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import websocketPlugin from "@fastify/websocket";
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import { registerSignalingRoutes } from "./signaling.js";
 import { register as metricsRegister } from "./metrics.js";
 import { initModerationStore } from "./moderationStore.js";
@@ -64,6 +65,24 @@ async function main() {
   });
   await app.register(websocketPlugin, {
     options: { maxPayload: 64 * 1024 },
+  });
+
+  // Per-IP HTTP request limiting. Only ever as strong as request.ip — see
+  // nginx/nginx.conf's X-Forwarded-For rewrite, which is what makes that
+  // value trustworthy in the first place. Global default is deliberately
+  // generous (this also covers /rooms, /stats, etc. getting polled by the
+  // front-end); the actual abuse-prone endpoints (/auth/register,
+  // /auth/login, and the "/ws" upgrade itself) get tighter per-route
+  // overrides where they're registered in signaling.ts.
+  // In-memory store: each replica in the docker-compose rollout enforces its
+  // own counters rather than a shared one (no Redis store wired in), same
+  // trade-off server/rateLimiter.ts makes for WS-message-level limits — a
+  // bot spread across replicas gets N replicas' worth of budget instead of
+  // one, but each replica still caps it instead of it being unbounded.
+  await app.register(rateLimit, {
+    global: true,
+    max: 300,
+    timeWindow: "1 minute",
   });
 
   app.get("/health", async () => ({ ok: true, CURRENT_ID }));

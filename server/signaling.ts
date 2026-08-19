@@ -10,7 +10,12 @@ import {
   signalsRelayedTotal,
   bannedIpConnectionsRejectedTotal,
   chatMessagesBlockedTotal,
+  wsRateLimitedTotal,
+  autoBansTotal,
+  turnstileVerificationsTotal,
 } from "./metrics.js";
+import { hitRateLimit, recordViolation } from "./rateLimiter.js";
+import { verifyTurnstileToken, TURNSTILE_ENABLED } from "./turnstile.js";
 import { signToken, verifyToken, requireAdmin } from "./auth.js";
 import {
   createAccount,
@@ -44,6 +49,36 @@ const CHAT_MAX_LEN = 500;
 const ANNOUNCEMENT_TEXT_MAX_LEN = 300;
 const ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN = 40;
 const BAN_REASON_MAX_LEN = 200;
+// Per-connection WS message rate limits. The two that matter for spam (a
+// bot blasting links into every room it can find) are "chat" and "join" —
+// "register" is limited too since a rename spam-broadcasts to the whole
+// room on every change (see the "register" case's peer-renamed broadcast).
+// Generous enough that no real user should ever notice them: nobody sends
+// >5 chat messages in 8s or joins >6 rooms in 10s by hand.
+const CHAT_RATE_LIMIT = 5;
+const CHAT_RATE_WINDOW_MS = 8_000;
+const JOIN_RATE_LIMIT = 6;
+const JOIN_RATE_WINDOW_MS = 10_000;
+const REGISTER_RATE_LIMIT = 8;
+const REGISTER_RATE_WINDOW_MS = 15_000;
+// How many rate-limit violations (across chat/join/register combined) the
+// same IP can rack up before it's treated as automated abuse rather than one
+// over-eager human and auto-banned the same way an admin doing it by hand
+// would (see banIp/disconnectClientsByIp) — this is what actually stops a
+// bot that just keeps reconnecting/retrying after being rate-limited.
+const AUTO_BAN_VIOLATION_LIMIT = 6;
+const AUTO_BAN_VIOLATION_WINDOW_MS = 60_000;
+const AUTO_BAN_DURATION_MINUTES = 60;
+// How long a passed Turnstile challenge is remembered per connection (see
+// ClientInfo.turnstileVerifiedAt) before the next join requires a fresh one
+// again — without an expiry, a single solved challenge would cover that
+// connection's joins forever (a WS socket doesn't expire on its own, and a
+// scripted client answers heartbeat pings same as a browser), letting a bot
+// pay for one challenge and then spam indefinitely at just-under-rate-limit
+// pace without ever tripping the auto-ban above. 10 minutes comfortably
+// covers a real person hopping between a few rooms in one sitting while
+// still capping how long one solve keeps paying off for a bot.
+const TURNSTILE_REVERIFY_INTERVAL_MS = 10 * 60_000;
 // Close code used to reject a connection from a banned IP — distinct from
 // SUPERSEDED_CLOSE_CODE below so the client can tell them apart and show the
 // right message instead of quietly retrying (see signalingClient.ts).
@@ -93,6 +128,13 @@ interface ClientInfo {
   // what admin-join checks in place of a separate admin token system.
   accountId?: string;
   flags?: string[];
+  // Timestamp of the last passed Turnstile challenge on this connection —
+  // later joins on the *same* socket (switching rooms) skip re-verifying as
+  // long as it's within TURNSTILE_REVERIFY_INTERVAL_MS. Deliberately
+  // per-connection, not persisted anywhere: a new socket (reload, reconnect)
+  // always starts unverified, since that's exactly the moment a bot would
+  // use to open a fresh connection and dodge the check.
+  turnstileVerifiedAt?: number;
 }
 
 interface RoomInfo {
@@ -415,6 +457,40 @@ function disconnectClientsByIp(ip: string) {
   }
 }
 
+// Enforces a per-connection rate limit for one message kind. Returns true if
+// the action is allowed to proceed. On a rejection it tells the sender (so a
+// legitimate client backs off instead of silently retrying forever) and
+// counts it as a violation for that IP — if the same IP crosses
+// AUTO_BAN_VIOLATION_LIMIT violations within AUTO_BAN_VIOLATION_WINDOW_MS,
+// it's auto-banned exactly like an admin ban (persisted, disconnects every
+// socket from that IP immediately). Fire-and-forget on the ban itself since
+// this runs on the hot message-handling path.
+function enforceRateLimit(
+  info: ClientInfo,
+  kind: "chat" | "join" | "register",
+  limit: number,
+  windowMs: number
+): boolean {
+  if (hitRateLimit(`${kind}:${info.id}`, limit, windowMs)) return true;
+  wsRateLimitedTotal.inc({ kind });
+  send(info.socket, {
+    type: "rate-limited",
+    kind,
+    message: "Você está enviando muito rápido. Aguarde um instante.",
+  });
+  if (recordViolation(info.ip, AUTO_BAN_VIOLATION_LIMIT, AUTO_BAN_VIOLATION_WINDOW_MS)) {
+    autoBansTotal.inc();
+    void banIp(
+      info.ip,
+      "Bloqueio automático: excesso de mensagens (possível bot de spam)",
+      AUTO_BAN_DURATION_MINUTES
+    )
+      .then(() => disconnectClientsByIp(info.ip))
+      .catch(() => {});
+  }
+  return false;
+}
+
 export function registerSignalingRoutes(app: FastifyInstance, genId: () => string) {
   // Detects and reaps half-dead connections (network dropped without a clean
   // close, e.g. mobile network handoff, sleeping laptop, NAT/proxy silently
@@ -476,7 +552,10 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // adminAuth.ts) — it's just an account whose flags include "ADMIN" (see
   // accountStore.ts's initAccountStore bootstrap), checked identically to
   // every other route below via requireAdmin.
-  app.post("/auth/register", async (request, reply) => {
+  // Tighter than the global default (see index.ts) — this is the endpoint a
+  // bot would hammer to farm accounts/reserved names, not something a real
+  // user does more than a couple times a minute.
+  app.post("/auth/register", { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } }, async (request, reply) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
     const username = (typeof body.username === "string" ? body.username.trim() : "").toLowerCase();
     const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
@@ -500,7 +579,9 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     }
   });
 
-  app.post("/auth/login", async (request, reply) => {
+  // Same reasoning as /auth/register — also blunts credential-stuffing
+  // attempts against real accounts.
+  app.post("/auth/login", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request, reply) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
     const username = typeof body.username === "string" ? body.username.trim() : "";
     const password = typeof body.password === "string" ? body.password : "";
@@ -699,7 +780,10 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return { words };
   });
 
-  app.get("/ws", { websocket: true }, (socket: WebSocket, request: FastifyRequest) => {
+  // Caps how many new sockets a single IP can open per minute — this is what
+  // stops a bot from just opening a fresh connection every time the
+  // per-message limits below (see enforceRateLimit) catch up to it.
+  app.get("/ws", { websocket: true, config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, (socket: WebSocket, request: FastifyRequest) => {
     const ip = request.ip;
     if (isIpBanned(ip)) {
       bannedIpConnectionsRejectedTotal.inc();
@@ -739,6 +823,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
 
       switch (msg.type) {
         case "register": {
+          if (!enforceRateLimit(info, "register", REGISTER_RATE_LIMIT, REGISTER_RATE_WINDOW_MS)) return;
           const rawName = typeof msg.name === "string" ? msg.name.trim().slice(0, 24) : "";
           if (!isValidDisplayName(rawName)) {
             registerErrorsTotal.inc();
@@ -818,6 +903,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           break;
         }
         case "join": {
+          if (!enforceRateLimit(info, "join", JOIN_RATE_LIMIT, JOIN_RATE_WINDOW_MS)) return;
           if (!info.name) {
             send(socket, { type: "error", message: "Registre um nome antes de entrar em uma sala." });
             return;
@@ -828,6 +914,38 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             return;
           }
           if (info.room === room) return;
+
+          // Gates the join itself — this is also how a room gets *created*
+          // in this codebase (the first join creates it), so this is the
+          // one checkpoint that covers both "someone spun up a new room"
+          // and "someone joined an existing one". Skipped if this connection
+          // already passed it recently (info.turnstileVerifiedAt — see
+          // ClientInfo and TURNSTILE_REVERIFY_INTERVAL_MS) so switching
+          // rooms doesn't re-challenge someone freshly verified on this same
+          // socket, while still forcing a re-check periodically rather than
+          // trusting one solve for the connection's entire lifetime. Checked
+          // before touching any room state; async (a real network call to
+          // Cloudflare), so re-validate afterwards in case this socket moved
+          // on (closed, or a second "join" already landed — see the
+          // loadPersistedChat comment below for why that's possible).
+          const turnstileStillFresh =
+            info.turnstileVerifiedAt !== undefined &&
+            Date.now() - info.turnstileVerifiedAt < TURNSTILE_REVERIFY_INTERVAL_MS;
+          if (TURNSTILE_ENABLED && !turnstileStillFresh) {
+            const token = typeof msg.turnstileToken === "string" ? msg.turnstileToken : "";
+            const verified = await verifyTurnstileToken(token, info.ip);
+            turnstileVerificationsTotal.inc({ result: verified ? "success" : "failure" });
+            if (!verified) {
+              send(socket, {
+                type: "turnstile-required",
+                message: "Verificação de segurança necessária para entrar na sala.",
+              });
+              return;
+            }
+            info.turnstileVerifiedAt = Date.now();
+            if (!clients.has(socket) || info.room === room) return;
+          }
+
           if (info.room) leaveRoom(info);
           clearRoomDeletionTimer(room);
           info.room = room;
@@ -933,6 +1051,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         }
         case "chat": {
           if (!info.room) return;
+          if (!enforceRateLimit(info, "chat", CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_MS)) return;
           const isGif = msg.kind === "gif";
           let chatMessage: ChatMessage;
           if (isGif) {
