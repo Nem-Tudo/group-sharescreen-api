@@ -1,5 +1,3 @@
-import fs from "node:fs";
-import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import type { WebSocket } from "ws";
 import {
@@ -18,6 +16,12 @@ import {
   verifyAdminToken,
   revokeAdminToken,
 } from "./adminAuth.js";
+import {
+  loadPersistedChat,
+  savePersistedChat,
+  deletePersistedChat,
+  type ChatMessage,
+} from "./chatStore.js";
 
 const HANDLE_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 const CLIENT_ID_RE = /^[a-zA-Z0-9-]{8,64}$/;
@@ -26,17 +30,11 @@ const CHAT_MAX_LEN = 500;
 const ANNOUNCEMENT_TEXT_MAX_LEN = 300;
 const ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN = 40;
 // Chat history is kept in memory for the room's lifetime (until it empties
-// out — see leaveRoom) and mirrored to disk so it also survives the
-// signaling process itself restarting (deploy, crash) while the room stays
-// populated. Capped so a long-lived room's history/file can't grow forever.
+// out — see leaveRoom) and mirrored via chatStore.ts (Redis if configured,
+// otherwise a per-room disk file) so it also survives the signaling process
+// itself restarting (deploy, crash) while the room stays populated. Capped
+// so a long-lived room's history can't grow forever.
 const ROOM_CHAT_HISTORY_LIMIT = 300;
-const CHAT_DATA_DIR = path.join(process.cwd(), "server", "data", "rooms");
-try {
-  fs.mkdirSync(CHAT_DATA_DIR, { recursive: true });
-} catch {
-  // Persistence degrades gracefully (in-memory only, for the process's
-  // lifetime) if the filesystem isn't writable — e.g. a read-only container.
-}
 
 // Any handle starting with this is private: excluded from the public /rooms
 // listing. This is the only thing that makes a room private — there's no
@@ -68,14 +66,6 @@ interface ClientInfo {
   isModerator?: boolean;
 }
 
-interface ChatMessage {
-  id: string;
-  from: string;
-  name: string;
-  text: string;
-  ts: number;
-}
-
 interface RoomInfo {
   sockets: Set<WebSocket>;
   createdAt: number;
@@ -105,46 +95,21 @@ const clients = new Map<WebSocket, ClientInfo>();
 const clientsById = new Map<string, ClientInfo>();
 const namesInUse = new Map<string, WebSocket>();
 const rooms = new Map<string, RoomInfo>();
+// Pending "really delete this now-empty room" timers, keyed by room — see
+// scheduleRoomDeletion.
+const roomDeletionTimers = new Map<string, NodeJS.Timeout>();
+// A page reload (Ctrl+R) closes the old socket and opens a new one a moment
+// later — long enough that an *immediate* delete-on-empty would wipe the
+// room's chat history out from under that reconnect. This grace period
+// covers a reload/brief network drop; only if the room is still empty once
+// it elapses do we actually tear it down.
+const ROOM_DELETION_GRACE_MS = 20_000;
 // Single site-wide banner, independent of any room — broadcastToAll below
 // pushes it to every open socket regardless of what room (if any) they're
 // in, and a fresh connection gets whatever's currently active appended
 // right after "welcome" so it isn't missed by someone who (re)connects
 // while it's up.
 let currentAnnouncement: Announcement | null = null;
-
-// `room` is always pre-validated against HANDLE_RE (alphanumeric/-/_ only)
-// by every caller before it reaches these, so it's safe to use directly as
-// a filename with no path-traversal risk.
-function chatFilePath(room: string): string {
-  return path.join(CHAT_DATA_DIR, `${room}.json`);
-}
-
-function loadPersistedChat(room: string): ChatMessage[] {
-  try {
-    const raw = fs.readFileSync(chatFilePath(room), "utf8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as ChatMessage[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function savePersistedChat(room: string, messages: ChatMessage[]) {
-  try {
-    fs.writeFileSync(chatFilePath(room), JSON.stringify(messages));
-  } catch {
-    // Best-effort — chat still works in-memory for the life of the room
-    // even if the disk write fails.
-  }
-}
-
-function deletePersistedChat(room: string) {
-  try {
-    fs.unlinkSync(chatFilePath(room));
-  } catch {
-    // Already gone (or nothing we can do about it) — fine either way.
-  }
-}
 
 // A WebRTC offer/answer/ICE candidate is only useful for a few seconds, but
 // `send()` below silently drops it if the target's socket isn't OPEN right
@@ -309,6 +274,33 @@ function realSharingCount(roomInfo: RoomInfo): number {
   return count;
 }
 
+// Cancels a pending scheduleRoomDeletion for `room`, if any — called
+// whenever someone (re)joins it, since that proves it didn't really empty
+// out for good.
+function clearRoomDeletionTimer(room: string) {
+  const timer = roomDeletionTimers.get(room);
+  if (timer) {
+    clearTimeout(timer);
+    roomDeletionTimers.delete(room);
+  }
+}
+
+// Tears the room down — both in memory and its persisted chat file — only
+// if it's still empty once ROOM_DELETION_GRACE_MS has elapsed, giving a
+// reload/brief drop time to reconnect and reclaim it first.
+function scheduleRoomDeletion(room: string) {
+  clearRoomDeletionTimer(room);
+  const timer = setTimeout(() => {
+    roomDeletionTimers.delete(room);
+    const roomInfo = rooms.get(room);
+    if (roomInfo && roomInfo.sockets.size === 0) {
+      rooms.delete(room);
+      deletePersistedChat(room);
+    }
+  }, ROOM_DELETION_GRACE_MS);
+  roomDeletionTimers.set(room, timer);
+}
+
 function leaveRoom(info: ClientInfo) {
   if (!info.room) return;
   const room = info.room;
@@ -316,13 +308,12 @@ function leaveRoom(info: ClientInfo) {
   if (roomInfo) {
     roomInfo.sockets.delete(info.socket);
     if (roomInfo.sockets.size === 0) {
-      // The room has genuinely emptied out — its chat history goes with it,
-      // both in memory and on disk. (A same-identity reconnect that briefly
+      // The room *looks* empty, but don't wipe its chat history yet — see
+      // scheduleRoomDeletion. (A same-identity reconnect that briefly
       // overlaps the old socket goes through detachSession instead, which
-      // deliberately does NOT delete the file, since that's not a real
-      // departure — see detachSession's comment.)
-      rooms.delete(room);
-      deletePersistedChat(room);
+      // deliberately does NOT delete the file either, since that's not a
+      // real departure — see detachSession's comment.)
+      scheduleRoomDeletion(room);
     }
   }
   info.room = null;
@@ -567,7 +558,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       info.isAlive = true;
     });
 
-    socket.on("message", (raw: Buffer) => {
+    socket.on("message", async (raw: Buffer) => {
       let msg: Record<string, unknown>;
       try {
         msg = JSON.parse(raw.toString());
@@ -639,18 +630,30 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           }
           if (info.room === room) return;
           if (info.room) leaveRoom(info);
+          clearRoomDeletionTimer(room);
           info.room = room;
           info.sharing = false;
           info.mic = false;
           let roomInfo = rooms.get(room);
           if (!roomInfo) {
-            // Reloads any chat history still on disk from before the room
-            // last emptied out or the process last restarted — see
-            // savePersistedChat/deletePersistedChat.
-            roomInfo = { sockets: new Set(), createdAt: Date.now(), messages: loadPersistedChat(room) };
-            rooms.set(room, roomInfo);
-            roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
+            // Reloads any chat history still persisted (chatStore.ts) from
+            // before the room last emptied out or the process last
+            // restarted. Awaiting here means another client's "join" for
+            // this same brand-new room could land while we wait — re-check
+            // after, so we don't clobber a RoomInfo that landed first.
+            const messages = await loadPersistedChat(room);
+            roomInfo = rooms.get(room);
+            if (!roomInfo) {
+              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages };
+              rooms.set(room, roomInfo);
+              roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
+            }
           }
+          // The await above gave this socket's own "leave"/another "join"
+          // a chance to run first and move it elsewhere (or the socket
+          // could've closed outright) — don't add it to a room it's no
+          // longer trying to join.
+          if (info.room !== room || !clients.has(socket)) return;
           roomInfo.sockets.add(socket);
           const peers = [...roomInfo.sockets]
             .filter((s) => s !== socket)
