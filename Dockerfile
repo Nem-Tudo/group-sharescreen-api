@@ -8,8 +8,8 @@ RUN npm ci
 FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
-ENV SIGNALING_HOST=0.0.0.0
-ENV SIGNALING_PORT=4000
+ENV HOST=0.0.0.0
+ENV PORT=4000
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./

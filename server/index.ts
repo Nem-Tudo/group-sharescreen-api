@@ -5,8 +5,8 @@ import cors from "@fastify/cors";
 import { registerSignalingRoutes } from "./signaling.js";
 import { register as metricsRegister } from "./metrics.js";
 
-const PORT = Number(process.env.SIGNALING_PORT || 4000);
-const HOST = process.env.SIGNALING_HOST || "0.0.0.0";
+const PORT = Number(process.env.PORT || 4000);
+const HOST = process.env.HOST || "0.0.0.0";
 // Optional: if set, /metrics requires `Authorization: Bearer <token>`.
 // Prometheus scrape configs support this natively (`bearer_token: ...`).
 // Left unset by default to match this project's no-config-needed-for-dev
