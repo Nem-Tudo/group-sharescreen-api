@@ -72,7 +72,9 @@ interface ChatMessage {
   id: string;
   from: string;
   name: string;
+  kind?: "text" | "gif";
   text: string;
+  url?: string;
   ts: number;
 }
 
@@ -192,6 +194,20 @@ function isValidChatText(text: string): boolean {
     if (code < 32 || code === 127) return false;
   }
   return true;
+}
+
+// Restricted to Giphy's own domain since this URL is trusted straight into
+// an <img src> on every client in the room — accepting arbitrary URLs here
+// would turn chat into an open image/tracking-pixel relay.
+function isValidGifUrl(url: string): boolean {
+  if (url.length > 500) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === "https:" && parsed.hostname.endsWith(".giphy.com");
 }
 
 // Same control-character guard as isValidDisplayName (no newlines — the
@@ -730,17 +746,33 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         }
         case "chat": {
           if (!info.room) return;
-          const text = typeof msg.text === "string" ? msg.text.trim().slice(0, CHAT_MAX_LEN) : "";
-          if (!isValidChatText(text)) return;
+          const isGif = msg.kind === "gif";
+          let chatMessage: ChatMessage;
+          if (isGif) {
+            const url = typeof msg.url === "string" ? msg.url.trim() : "";
+            if (!isValidGifUrl(url)) return;
+            chatMessage = {
+              id: genId(),
+              from: info.id,
+              name: info.name as string,
+              kind: "gif",
+              text: "",
+              url,
+              ts: Date.now(),
+            };
+          } else {
+            const text = typeof msg.text === "string" ? msg.text.trim().slice(0, CHAT_MAX_LEN) : "";
+            if (!isValidChatText(text)) return;
+            chatMessage = {
+              id: genId(),
+              from: info.id,
+              name: info.name as string,
+              text,
+              ts: Date.now(),
+            };
+          }
           const roomInfo = rooms.get(info.room);
           if (!roomInfo) return;
-          const chatMessage: ChatMessage = {
-            id: genId(),
-            from: info.id,
-            name: info.name as string,
-            text,
-            ts: Date.now(),
-          };
           roomInfo.messages.push(chatMessage);
           if (roomInfo.messages.length > ROOM_CHAT_HISTORY_LIMIT) {
             roomInfo.messages.splice(0, roomInfo.messages.length - ROOM_CHAT_HISTORY_LIMIT);
