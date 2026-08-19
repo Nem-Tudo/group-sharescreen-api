@@ -25,7 +25,12 @@ async function main() {
   // Access-Control-Allow-Methods that doesn't include DELETE, so it blocks
   // the real request client-side with a CORS error before it ever reaches
   // this server.
-  await app.register(cors, { origin: true, methods: ["GET", "HEAD", "POST", "DELETE"] });
+  await app.register(cors, {
+    origin: true,
+    methods: ["GET", "HEAD", "POST", "DELETE"],
+    allowedHeaders: "*",
+    exposedHeaders: "*",
+  });
   await app.register(websocketPlugin, {
     options: { maxPayload: 64 * 1024 },
   });
