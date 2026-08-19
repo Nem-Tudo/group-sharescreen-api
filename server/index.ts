@@ -1,9 +1,14 @@
+import dotenv from 'dotenv';
+
+dotenv.config();
+
 import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import websocketPlugin from "@fastify/websocket";
 import cors from "@fastify/cors";
 import { registerSignalingRoutes } from "./signaling.js";
 import { register as metricsRegister } from "./metrics.js";
+import { initModerationStore } from "./moderationStore.js";
 
 const PORT = Number(process.env.PORT || 4000);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -17,7 +22,18 @@ const METRICS_TOKEN = process.env.METRICS_TOKEN || null;
 const CURRENT_ID = randomUUID()
 
 async function main() {
-  const app = Fastify({ logger: true });
+  // trustProxy: this always runs behind a reverse proxy in production (see
+  // README — apigolive.nemtudo.me), so request.ip needs to read the real
+  // client address from X-Forwarded-For instead of the proxy's own address.
+  // Without it every connection would appear to come from the same IP,
+  // making IP bans useless.
+  const app = Fastify({ logger: true, trustProxy: true });
+
+  // Loads persisted IP bans and banned words (Mongo if MONGO_URL is set,
+  // otherwise a local JSON file — see moderationStore.ts) before the server
+  // starts accepting connections, so the very first WebSocket upgrade is
+  // already checked against whatever was configured in a previous run.
+  await initModerationStore();
 
   // @fastify/cors defaults to methods: "GET,HEAD,POST" — without listing
   // DELETE explicitly here, the browser's preflight for

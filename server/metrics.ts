@@ -177,3 +177,15 @@ export const signalsRelayedTotal = new Counter({
   labelNames: ["kind"],
   registers: [register],
 });
+
+export const bannedIpConnectionsRejectedTotal = new Counter({
+  name: "sharescreen_banned_ip_connections_rejected_total",
+  help: "WebSocket connection attempts rejected because the source IP is banned",
+  registers: [register],
+});
+
+export const chatMessagesBlockedTotal = new Counter({
+  name: "sharescreen_chat_messages_blocked_total",
+  help: "Chat messages blocked by the banned-words filter",
+  registers: [register],
+});

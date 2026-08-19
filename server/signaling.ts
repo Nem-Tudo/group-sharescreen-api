@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { WebSocket } from "ws";
 import {
   registerStatsProvider,
@@ -8,6 +8,8 @@ import {
   registerErrorsTotal,
   roomsCreatedTotal,
   signalsRelayedTotal,
+  bannedIpConnectionsRejectedTotal,
+  chatMessagesBlockedTotal,
 } from "./metrics.js";
 import {
   ADMIN_ENABLED,
@@ -22,6 +24,17 @@ import {
   deletePersistedChat,
   type ChatMessage,
 } from "./chatStore.js";
+import {
+  isIpBanned,
+  isValidIp,
+  listBans,
+  banIp,
+  unbanIp,
+  listBannedWords,
+  setBannedWords,
+  findBannedWord,
+} from "./moderationStore.js";
+import { MONGO_ENABLED, isMongoConnected } from "./mongo.js";
 
 const HANDLE_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 const CLIENT_ID_RE = /^[a-zA-Z0-9-]{8,64}$/;
@@ -29,6 +42,11 @@ const HEARTBEAT_INTERVAL_MS = 25_000;
 const CHAT_MAX_LEN = 500;
 const ANNOUNCEMENT_TEXT_MAX_LEN = 300;
 const ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN = 40;
+const BAN_REASON_MAX_LEN = 200;
+// Close code used to reject a connection from a banned IP — distinct from
+// SUPERSEDED_CLOSE_CODE below so the client can tell them apart and show the
+// right message instead of quietly retrying (see signalingClient.ts).
+const BANNED_CLOSE_CODE = 4003;
 // Chat history is kept in memory for the room's lifetime (until it empties
 // out — see leaveRoom) and mirrored via chatStore.ts (Redis if configured,
 // otherwise a per-room disk file) so it also survives the signaling process
@@ -53,6 +71,10 @@ interface ClientInfo {
   mic: boolean;
   isAlive: boolean;
   socket: WebSocket;
+  // The connecting IP (see request.ip in the "/ws" handler below). Never
+  // sent to regular participants — only /admin/rooms exposes it, so a
+  // moderator can ban whoever's misbehaving straight from the room list.
+  ip: string;
   // Set for a moderator connection opened via "admin-join" (see
   // registerAdminRoutes below). Moderator sockets ride the exact same room
   // machinery as a real participant — they're added to the room's socket
@@ -375,6 +397,17 @@ function detachSession(info: ClientInfo) {
   info.socket.close(SUPERSEDED_CLOSE_CODE, "superseded-by-new-connection");
 }
 
+// Terminates every socket currently connected from `ip` — called right
+// after an admin bans it, so the ban takes effect immediately instead of
+// only blocking that IP's *next* connection attempt.
+function disconnectClientsByIp(ip: string) {
+  for (const info of clients.values()) {
+    if (info.ip === ip) {
+      info.socket.close(BANNED_CLOSE_CODE, "ip-banned");
+    }
+  }
+}
+
 export function registerSignalingRoutes(app: FastifyInstance, genId: () => string) {
   // Detects and reaps half-dead connections (network dropped without a clean
   // close, e.g. mobile network handoff, sleeping laptop, NAT/proxy silently
@@ -470,7 +503,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         peers: [...info.sockets]
           .map((s) => clients.get(s))
           .filter((c): c is ClientInfo => c !== undefined && !c.isModerator)
-          .map((c) => ({ id: c.id, name: c.name, sharing: c.sharing, mic: c.mic })),
+          .map((c) => ({ id: c.id, name: c.name, sharing: c.sharing, mic: c.mic, ip: c.ip })),
       }))
       .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
     return { rooms: allRooms };
@@ -551,7 +584,121 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return reply.code(204).send();
   });
 
-  app.get("/ws", { websocket: true }, (socket: WebSocket) => {
+  // Dashboard overview for the admin panel — aggregate numbers only (no
+  // room/peer detail, see /admin/rooms for that), so it's cheap to poll.
+  app.get("/admin/stats", async (request, reply) => {
+    if (!ADMIN_ENABLED) return reply.code(404).send();
+    const header = request.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (!verifyAdminToken(token)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    let peopleOnline = 0;
+    let sharingCount = 0;
+    let publicRooms = 0;
+    let privateRooms = 0;
+    for (const [handle, info] of rooms) {
+      peopleOnline += realPeopleCount(info);
+      sharingCount += realSharingCount(info);
+      if (isPrivateRoom(handle)) privateRooms += 1;
+      else publicRooms += 1;
+    }
+    return {
+      connectedSockets: clients.size,
+      peopleOnline,
+      sharingCount,
+      publicRooms,
+      privateRooms,
+      bannedIps: listBans().length,
+      bannedWords: listBannedWords().length,
+      mongo: { enabled: MONGO_ENABLED, connected: isMongoConnected() },
+    };
+  });
+
+  // IP ban list/management. Banning takes effect immediately: any socket
+  // currently connected from that IP is disconnected right away (see
+  // disconnectClientsByIp), and every future "/ws" upgrade from it is
+  // rejected before it's ever added to `clients` — see the handler below.
+  app.get("/admin/bans", async (request, reply) => {
+    if (!ADMIN_ENABLED) return reply.code(404).send();
+    const header = request.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (!verifyAdminToken(token)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    return { bans: listBans() };
+  });
+
+  app.post("/admin/bans", async (request, reply) => {
+    if (!ADMIN_ENABLED) return reply.code(404).send();
+    const header = request.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (!verifyAdminToken(token)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const ip = typeof body.ip === "string" ? body.ip.trim() : "";
+    const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, BAN_REASON_MAX_LEN) : "";
+    const durationMinutes =
+      typeof body.durationMinutes === "number" && Number.isFinite(body.durationMinutes) && body.durationMinutes > 0
+        ? body.durationMinutes
+        : null;
+    if (!isValidIp(ip)) {
+      return reply.code(400).send({ error: "IP inválido." });
+    }
+    const ban = await banIp(ip, reason, durationMinutes);
+    disconnectClientsByIp(ip);
+    return { ban };
+  });
+
+  app.delete("/admin/bans/:ip", async (request, reply) => {
+    if (!ADMIN_ENABLED) return reply.code(404).send();
+    const header = request.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (!verifyAdminToken(token)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const { ip } = request.params as { ip: string };
+    await unbanIp(ip);
+    return reply.code(204).send();
+  });
+
+  // Chat content filter — one flat list of forbidden words/phrases, replaced
+  // wholesale on every PUT (see setBannedWords) rather than incremental
+  // add/remove endpoints, matching the shape of a single admin textarea.
+  app.get("/admin/banned-words", async (request, reply) => {
+    if (!ADMIN_ENABLED) return reply.code(404).send();
+    const header = request.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (!verifyAdminToken(token)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    return { words: listBannedWords() };
+  });
+
+  app.put("/admin/banned-words", async (request, reply) => {
+    if (!ADMIN_ENABLED) return reply.code(404).send();
+    const header = request.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (!verifyAdminToken(token)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    if (!Array.isArray(body.words) || !body.words.every((w) => typeof w === "string")) {
+      return reply.code(400).send({ error: "Lista de palavras inválida." });
+    }
+    const words = await setBannedWords(body.words as string[]);
+    return { words };
+  });
+
+  app.get("/ws", { websocket: true }, (socket: WebSocket, request: FastifyRequest) => {
+    const ip = request.ip;
+    if (isIpBanned(ip)) {
+      bannedIpConnectionsRejectedTotal.inc();
+      socket.close(BANNED_CLOSE_CODE, "ip-banned");
+      return;
+    }
+
     const info: ClientInfo = {
       id: genId(),
       name: null,
@@ -560,6 +707,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       mic: false,
       isAlive: true,
       socket,
+      ip,
     };
     clients.set(socket, info);
     wsConnectionsTotal.inc();
@@ -768,6 +916,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           } else {
             const text = typeof msg.text === "string" ? msg.text.trim().slice(0, CHAT_MAX_LEN) : "";
             if (!isValidChatText(text)) return;
+            if (findBannedWord(text)) {
+              chatMessagesBlockedTotal.inc();
+              send(socket, {
+                type: "chat-blocked",
+                message: "Sua mensagem contém uma palavra não permitida.",
+              });
+              return;
+            }
             chatMessage = {
               id: genId(),
               from: info.id,
