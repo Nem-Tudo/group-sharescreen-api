@@ -1,0 +1,18 @@
+{
+  "name": "sharescreen-api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "tsx server/index.ts"
+  },
+  "dependencies": {
+    "@types/node": "^20",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5",
+    "@fastify/cors": "^11.3.0",
+    "@fastify/websocket": "^11.3.0",
+    "fastify": "^5.12.0",
+    "prom-client": "^15.1.3",
+    "tsx": "^4.23.12"
+  }
+}
