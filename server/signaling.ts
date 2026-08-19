@@ -11,13 +11,14 @@ import {
   bannedIpConnectionsRejectedTotal,
   chatMessagesBlockedTotal,
 } from "./metrics.js";
+import { signToken, verifyToken, requireAdmin } from "./auth.js";
 import {
-  ADMIN_ENABLED,
-  checkBasicAuth,
-  createAdminToken,
-  verifyAdminToken,
-  revokeAdminToken,
-} from "./adminAuth.js";
+  createAccount,
+  verifyAccountLogin,
+  getPublicAccountById,
+  isNameReserved,
+  USERNAME_RE,
+} from "./accountStore.js";
 import {
   loadPersistedChat,
   savePersistedChat,
@@ -86,6 +87,12 @@ interface ClientInfo {
   // participant list and count — nothing server-side ever filters a
   // moderator out of a room, only out of numbers/lists real users see.
   isModerator?: boolean;
+  // Set when this connection registered with a valid account JWT (see the
+  // "register" case below) — lets the reserved-name check tell a genuine
+  // account owner apart from anyone else trying to use their name, and is
+  // what admin-join checks in place of a separate admin token system.
+  accountId?: string;
+  flags?: string[];
 }
 
 interface RoomInfo {
@@ -464,34 +471,62 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return { rooms: publicRooms };
   });
 
-  // Moderation surface, gated entirely behind ADMIN_USER/ADMIN_PASSWORD
-  // (see adminAuth.ts) — every route below 404s outright if those env vars
-  // aren't both set, so there's no accidental half-open admin endpoint on a
-  // deployment that never opted in.
-  app.post("/admin/login", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    if (!checkBasicAuth(request.headers.authorization)) {
-      reply.header("WWW-Authenticate", 'Basic realm="admin"');
-      return reply.code(401).send({ error: "unauthorized" });
+  // Account system: create/login work for anyone, no auth required going
+  // in. Admin is no longer a separate Basic-Auth credential (see the old
+  // adminAuth.ts) — it's just an account whose flags include "ADMIN" (see
+  // accountStore.ts's initAccountStore bootstrap), checked identically to
+  // every other route below via requireAdmin.
+  app.post("/auth/register", async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const username = typeof body.username === "string" ? body.username.trim() : "";
+    const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    if (!USERNAME_RE.test(username)) {
+      return reply.code(400).send({ error: "Usuário inválido — use 3 a 20 letras, números ou _." });
     }
-    return { token: createAdminToken() };
+    if (!isValidDisplayName(displayName)) {
+      return reply.code(400).send({ error: "Nome de exibição inválido." });
+    }
+    if (password.length < 6 || password.length > 200) {
+      return reply.code(400).send({ error: "Senha deve ter entre 6 e 200 caracteres." });
+    }
+    try {
+      const account = await createAccount(username, displayName, password, request.ip);
+      const token = signToken({ sub: account.id, username: account.username, flags: account.flags });
+      return { token, account };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Falha ao criar conta.";
+      return reply.code(409).send({ error: message });
+    }
   });
 
-  app.post("/admin/logout", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    if (header.startsWith("Bearer ")) revokeAdminToken(header.slice(7));
-    return reply.code(204).send();
+  app.post("/auth/login", async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const username = typeof body.username === "string" ? body.username.trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const account = await verifyAccountLogin(username, password, request.ip);
+    if (!account) {
+      return reply.code(401).send({ error: "Usuário ou senha inválidos." });
+    }
+    const token = signToken({ sub: account.id, username: account.username, flags: account.flags });
+    return { token, account };
+  });
+
+  app.get("/auth/me", async (request, reply) => {
+    const payload = verifyToken(request.headers.authorization?.startsWith("Bearer ")
+      ? request.headers.authorization.slice(7)
+      : null);
+    if (!payload) return reply.code(401).send({ error: "unauthorized" });
+    const account = getPublicAccountById(payload.sub);
+    if (!account) return reply.code(401).send({ error: "unauthorized" });
+    return { account };
   });
 
   // Full room directory for moderators — unlike /rooms, this includes
   // private rooms and per-peer detail, since moderation is the one
   // legitimate reason to need that visibility.
   app.get("/admin/rooms", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     const allRooms = [...rooms.entries()]
@@ -514,20 +549,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // already active on load; POST replaces it (and re-broadcasts); DELETE
   // ends it for everyone currently connected.
   app.get("/admin/announcement", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     return { announcement: currentAnnouncement };
   });
 
   app.post("/admin/announcement", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
 
@@ -573,10 +602,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   });
 
   app.delete("/admin/announcement", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     currentAnnouncement = null;
@@ -587,10 +613,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // Dashboard overview for the admin panel — aggregate numbers only (no
   // room/peer detail, see /admin/rooms for that), so it's cheap to poll.
   app.get("/admin/stats", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     let peopleOnline = 0;
@@ -620,20 +643,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // disconnectClientsByIp), and every future "/ws" upgrade from it is
   // rejected before it's ever added to `clients` — see the handler below.
   app.get("/admin/bans", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     return { bans: listBans() };
   });
 
   app.post("/admin/bans", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     const body = (request.body ?? {}) as Record<string, unknown>;
@@ -652,10 +669,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   });
 
   app.delete("/admin/bans/:ip", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     const { ip } = request.params as { ip: string };
@@ -667,20 +681,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // wholesale on every PUT (see setBannedWords) rather than incremental
   // add/remove endpoints, matching the shape of a single admin textarea.
   app.get("/admin/banned-words", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     return { words: listBannedWords() };
   });
 
   app.put("/admin/banned-words", async (request, reply) => {
-    if (!ADMIN_ENABLED) return reply.code(404).send();
-    const header = request.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!verifyAdminToken(token)) {
+    if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     const body = (request.body ?? {}) as Record<string, unknown>;
@@ -745,6 +753,13 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // is still around (server restart wiped nothing since it's a
           // fresh process, but a plain reconnect can race the heartbeat
           // reaper), take it over cleanly first.
+          // A logged-in client passes its JWT here so the rest of this
+          // session (the reserved-name check right below, admin checks,
+          // etc) can trust info.accountId instead of re-verifying a token
+          // on every message.
+          const rawToken = typeof msg.token === "string" ? msg.token : "";
+          const authPayload = rawToken ? verifyToken(rawToken) : null;
+
           const requestedClientId = typeof msg.clientId === "string" ? msg.clientId : "";
           const clientId = CLIENT_ID_RE.test(requestedClientId) ? requestedClientId : null;
           const existingById = clientId ? clientsById.get(clientId) : undefined;
@@ -759,10 +774,25 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             send(socket, { type: "register-error", message: "Esse nome já está em uso." });
             return;
           }
+          // A name tied to a registered account (its username or display
+          // name) is reserved for that account's owner — anyone else, guest
+          // or a different account, trying to register under it gets
+          // rejected the same as an already-in-use name above.
+          const reservedOwnerId = isNameReserved(key);
+          if (reservedOwnerId && reservedOwnerId !== authPayload?.sub) {
+            registerErrorsTotal.inc();
+            send(socket, {
+              type: "register-error",
+              message: "Esse nome pertence a uma conta registrada.",
+            });
+            return;
+          }
           const previousName = info.name;
           if (info.name) namesInUse.delete(info.name.toLowerCase());
           info.name = rawName;
           namesInUse.set(key, socket);
+          info.accountId = authPayload?.sub;
+          info.flags = authPayload?.flags;
 
           if (clientId && clientId !== info.id) {
             if (clientsById.get(info.id) === info) clientsById.delete(info.id);
@@ -770,7 +800,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           }
           clientsById.set(info.id, info);
 
-          send(socket, { type: "registered", id: info.id, name: rawName });
+          send(socket, {
+            type: "registered",
+            id: info.id,
+            name: rawName,
+            account: authPayload
+              ? { username: authPayload.username, flags: authPayload.flags }
+              : null,
+          });
 
           // Renaming while already in a room doesn't go through "join"
           // again, so nothing else would tell the other participants —
@@ -837,12 +874,9 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         // plain "leave" message (and socket close already calls
         // leaveRoom() regardless), so no separate cleanup path is needed.
         case "admin-join": {
-          if (!ADMIN_ENABLED) {
-            send(socket, { type: "error", message: "Moderação desativada." });
-            return;
-          }
           const token = typeof msg.token === "string" ? msg.token : "";
-          if (!verifyAdminToken(token)) {
+          const adminPayload = verifyToken(token);
+          if (!adminPayload || !adminPayload.flags.includes("ADMIN")) {
             send(socket, { type: "error", message: "Não autorizado." });
             socket.terminate();
             return;

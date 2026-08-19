@@ -1,6 +1,15 @@
-import dotenv from 'dotenv';
-
-dotenv.config();
+// Side-effect import (not `import dotenv from "dotenv"; dotenv.config();`)
+// on purpose: ES module evaluation runs every statically imported module
+// (signaling.js, accountStore.js, mongo.ts, auth.ts, and everything they in
+// turn import) to completion *before* any of this file's own top-level
+// statements run — regardless of where those statements sit relative to
+// the import declarations in the source. A plain `dotenv.config()` call
+// here would therefore only populate process.env after ADMIN_USER,
+// MONGO_URL, JWT_SECRET etc. had already been read (as undefined) by those
+// modules' own top-level code. Being the first *import* instead makes it
+// the first module actually evaluated, ahead of everything else this file
+// imports.
+import "dotenv/config";
 
 import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
@@ -9,6 +18,7 @@ import cors from "@fastify/cors";
 import { registerSignalingRoutes } from "./signaling.js";
 import { register as metricsRegister } from "./metrics.js";
 import { initModerationStore } from "./moderationStore.js";
+import { initAccountStore } from "./accountStore.js";
 
 const PORT = Number(process.env.PORT || 4000);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -34,6 +44,10 @@ async function main() {
   // starts accepting connections, so the very first WebSocket upgrade is
   // already checked against whatever was configured in a previous run.
   await initModerationStore();
+  // Loads registered accounts (and bootstraps the initial ADMIN one from
+  // ADMIN_USER/ADMIN_PASSWORD if configured) before the server starts
+  // accepting connections — see accountStore.ts.
+  await initAccountStore();
 
   // @fastify/cors defaults to methods: "GET,HEAD,POST" — without listing
   // DELETE and PUT explicitly here, the browser's preflight for
