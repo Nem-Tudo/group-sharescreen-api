@@ -24,4 +24,10 @@ USER app
 
 EXPOSE 4000
 
-CMD ["npm", "start"]
+# Runs tsx directly as PID 1 rather than `npm start` — npm wraps the script
+# in a `sh -c` child process that does not reliably forward SIGTERM to it,
+# which meant Kubernetes' rollout signal never reached the graceful-shutdown
+# handler in server/index.ts. Confirmed with a manual SIGTERM test: killing
+# the `npm start` process left the underlying tsx/node process (and every
+# open WebSocket) running untouched.
+CMD ["node_modules/.bin/tsx", "server/index.ts"]

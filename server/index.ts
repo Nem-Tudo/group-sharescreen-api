@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import websocketPlugin from "@fastify/websocket";
 import cors from "@fastify/cors";
-import { registerSignalingRoutes } from "./signaling.js";
+import { registerSignalingRoutes, shutdownSignaling } from "./signaling.js";
 import { register as metricsRegister } from "./metrics.js";
 import { initModerationStore } from "./moderationStore.js";
 import { initAccountStore } from "./accountStore.js";
@@ -81,7 +81,7 @@ async function main() {
   });
 
   await app.register(async (instance) => {
-    registerSignalingRoutes(instance, randomUUID);
+    registerSignalingRoutes(instance, randomUUID, CURRENT_ID);
   });
 
   try {
@@ -90,6 +90,36 @@ async function main() {
     app.log.error(err);
     process.exit(1);
   }
+
+  // Rollout-safe shutdown: on SIGTERM (Kubernetes' "please stop" signal
+  // before it kills the pod), warn every connected client and close their
+  // sockets in an orderly way instead of letting the process die out from
+  // under them — see shutdownSignaling in signaling.ts. Pair this with a
+  // terminationGracePeriodSeconds comfortably above SHUTDOWN_TIMEOUT_MS in
+  // the deployment so Kubernetes doesn't SIGKILL before this finishes.
+  const SHUTDOWN_TIMEOUT_MS = 10_000;
+  let shuttingDown = false;
+  const shutdown = async (signal: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    app.log.info({ signal }, "Recebido sinal de encerramento, iniciando shutdown gracioso");
+    const forceExit = setTimeout(() => {
+      app.log.warn("Shutdown gracioso excedeu o tempo limite, forçando saída");
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    forceExit.unref();
+    try {
+      await shutdownSignaling();
+      await app.close();
+    } catch (err) {
+      app.log.error(err);
+    } finally {
+      clearTimeout(forceExit);
+      process.exit(0);
+    }
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 }
 
 main();

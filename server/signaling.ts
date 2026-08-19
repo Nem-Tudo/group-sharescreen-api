@@ -36,6 +36,23 @@ import {
   findBannedWord,
 } from "./moderationStore.js";
 import { MONGO_ENABLED, isMongoConnected } from "./mongo.js";
+import {
+  CLUSTER_ENABLED,
+  subscribeRoom,
+  unsubscribeRoom,
+  publishRoomEvent,
+  upsertPeer,
+  removePeer,
+  listPeers,
+  listActiveRooms,
+  refreshPeers,
+  sweepStalePeers,
+  isRoomGloballyEmpty,
+  pushPendingSignal,
+  popPendingSignals,
+  type ClusterEvent,
+  type RemotePeer,
+} from "./cluster.js";
 
 const HANDLE_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 const CLIENT_ID_RE = /^[a-zA-Z0-9-]{8,64}$/;
@@ -54,6 +71,13 @@ const BANNED_CLOSE_CODE = 4003;
 // itself restarting (deploy, crash) while the room stays populated. Capped
 // so a long-lived room's history can't grow forever.
 const ROOM_CHAT_HISTORY_LIMIT = 300;
+
+// How long a peer can go without a heartbeat-refreshed presence entry in
+// Redis before sweepStalePeers reaps it — a safety net for an instance that
+// vanished without a clean close (crash, OOM kill). The graceful-shutdown
+// path (shutdownSignaling) removes its own peers immediately, so in the
+// common rollout case this never finds anything to reap.
+const STALE_PEER_AFTER_MS = HEARTBEAT_INTERVAL_MS * 3;
 
 // Any handle starting with this is private: excluded from the public /rooms
 // listing. This is the only thing that makes a room private — there's no
@@ -139,6 +163,13 @@ const ROOM_DELETION_GRACE_MS = 20_000;
 // right after "welcome" so it isn't missed by someone who (re)connects
 // while it's up.
 let currentAnnouncement: Announcement | null = null;
+
+// Set once by registerSignalingRoutes (called a single time at process
+// startup) — every cluster.ts call needs to tag its events/presence writes
+// with which instance produced them, and shutdownSignaling needs the
+// heartbeat timer to stop it during a graceful shutdown.
+let instanceId = "";
+let heartbeatTimer: NodeJS.Timeout | null = null;
 
 // A WebRTC offer/answer/ICE candidate is only useful for a few seconds, but
 // `send()` below silently drops it if the target's socket isn't OPEN right
@@ -261,7 +292,13 @@ function queueSignal(targetId: string, from: string, data: unknown) {
 // looked up via clientsById), since a silently-watching moderator socket
 // (see "admin-join") never registers a name and so never gets a clientsById
 // entry at all.
-function deliverOrQueueSignal(room: string, targetId: string, from: string, data: unknown) {
+// Delivers a relayed signal immediately if the target is reachable locally
+// right now. Otherwise, when clustered, publishes it so whichever instance
+// currently holds the target socket can deliver it directly, AND queues it
+// in Redis in case the target isn't connected anywhere yet (reconnect may
+// land on a different instance than the one that queued it, so this can't
+// stay in the local pendingSignals map the way it does unclustered).
+async function deliverOrQueueSignal(room: string, targetId: string, from: string, data: unknown) {
   const roomInfo = rooms.get(room);
   const target = roomInfo
     ? [...roomInfo.sockets].map((s) => clients.get(s)).find((c) => c?.id === targetId)
@@ -270,14 +307,29 @@ function deliverOrQueueSignal(room: string, targetId: string, from: string, data
     send(target.socket, { type: "signal", from, data });
     return;
   }
+  if (CLUSTER_ENABLED) {
+    await Promise.all([
+      publishRoomEvent(room, instanceId, "signal", { to: targetId, from, data }),
+      pushPendingSignal(targetId, { from, data, queuedAt: Date.now() }, Math.ceil(PENDING_SIGNAL_TTL_MS / 1000)),
+    ]);
+    return;
+  }
   queueSignal(targetId, from, data);
 }
 
-function flushPendingSignals(info: ClientInfo) {
+async function flushPendingSignals(info: ClientInfo) {
+  const now = Date.now();
+  if (CLUSTER_ENABLED) {
+    const remote = await popPendingSignals(info.id);
+    for (const item of remote) {
+      if (now - item.queuedAt > PENDING_SIGNAL_TTL_MS) continue;
+      send(info.socket, { type: "signal", from: item.from, data: item.data });
+    }
+    return;
+  }
   const queue = pendingSignals.get(info.id);
   if (!queue) return;
   pendingSignals.delete(info.id);
-  const now = Date.now();
   for (const item of queue) {
     if (now - item.queuedAt > PENDING_SIGNAL_TTL_MS) continue;
     send(info.socket, { type: "signal", from: item.from, data: item.data });
@@ -317,6 +369,119 @@ function realSharingCount(roomInfo: RoomInfo): number {
   return count;
 }
 
+function toRemotePeer(info: ClientInfo): Omit<RemotePeer, "lastSeen"> {
+  return {
+    id: info.id,
+    name: info.name,
+    sharing: info.sharing,
+    mic: info.mic,
+    instanceId,
+    ...(info.isModerator ? { role: "moderator" as const } : {}),
+  };
+}
+
+function localPeerSummaries(roomInfo: RoomInfo, excludeId: string) {
+  return [...roomInfo.sockets]
+    .map((s) => clients.get(s))
+    .filter((c): c is ClientInfo => c !== undefined && c.id !== excludeId)
+    .map(peerSummary);
+}
+
+// Peer list for a "room-state"/"admin room-state" reply. Without clustering
+// this is exactly the old behavior (scan local sockets). Clustered, Redis is
+// the source of truth for room membership — it already includes this
+// instance's own peers (every join/sharing/mic/rename upserts there too),
+// so a plain listPeers() covers peers on every instance at once. Falls back
+// to the local view if Redis comes back empty (a hiccup, or this peer's own
+// upsert hasn't landed yet) rather than showing an empty room.
+async function getRoomPeers(room: string, excludeId: string, roomInfo: RoomInfo) {
+  if (!CLUSTER_ENABLED) return localPeerSummaries(roomInfo, excludeId);
+  const remote = await listPeers(room);
+  if (remote.length === 0) return localPeerSummaries(roomInfo, excludeId);
+  return remote
+    .filter((p) => p.id !== excludeId)
+    .map((p) => ({ id: p.id, name: p.name, sharing: p.sharing, mic: p.mic, ...(p.role ? { role: p.role } : {}) }));
+}
+
+function realPeopleCountFromPeers(peers: RemotePeer[]): number {
+  return peers.filter((p) => !p.role).length;
+}
+
+function realSharingCountFromPeers(peers: RemotePeer[]): number {
+  return peers.filter((p) => !p.role && p.sharing).length;
+}
+
+// Global room directory sourced from Redis — used by the public/admin HTTP
+// listing routes so they answer the same regardless of which instance in
+// the cluster serves the request. (Unlike registerStatsProvider's callback
+// below, which deliberately stays local-only: that one feeds /metrics,
+// where a per-replica Prometheus gauge is correct and a global figure
+// repeated by every replica would double-count once summed across pods.)
+async function getAggregateRooms(): Promise<Array<{ handle: string; createdAt: number; peers: RemotePeer[] }>> {
+  const active = await listActiveRooms();
+  return Promise.all(
+    active.map(async ({ handle, createdAt }) => ({ handle, createdAt, peers: await listPeers(handle) }))
+  );
+}
+
+// Relays a room event published by another instance to this instance's own
+// local sockets in that room. Registered once per room via subscribeRoom,
+// for as long as this instance has at least one local socket in it.
+function makeClusterHandler(room: string) {
+  return (event: ClusterEvent) => {
+    if (event.instanceId === instanceId) return;
+    switch (event.type) {
+      case "peer-joined":
+      case "peer-left":
+      case "peer-sharing":
+      case "peer-mic":
+      case "peer-renamed":
+        broadcastToRoom(room, { type: event.type, ...(event.payload as Record<string, unknown>) });
+        break;
+      case "chat-message": {
+        // Mirror the message into this instance's own local RoomInfo cache
+        // too, not just the live broadcast — otherwise a room whose local
+        // RoomInfo predates the message (created before this instance ever
+        // saw this particular chat event) keeps serving a stale
+        // "room-state" history to anyone who (re)joins here afterward, even
+        // though the message reached everyone live at the time.
+        const roomInfo = rooms.get(room);
+        if (roomInfo) {
+          roomInfo.messages.push(event.payload as ChatMessage);
+          if (roomInfo.messages.length > ROOM_CHAT_HISTORY_LIMIT) {
+            roomInfo.messages.splice(0, roomInfo.messages.length - ROOM_CHAT_HISTORY_LIMIT);
+          }
+        }
+        broadcastToRoom(room, { type: "chat-message", ...(event.payload as Record<string, unknown>) });
+        break;
+      }
+      case "signal": {
+        const { to, from, data } = event.payload as { to: string; from: string; data: unknown };
+        const target = clientsById.get(to);
+        if (target) send(target.socket, { type: "signal", from, data });
+        break;
+      }
+    }
+  };
+}
+
+// Gets (or lazily creates) the local RoomInfo for `room` without touching
+// roomsCreatedTotal — used by admin-join, which may be the first thing to
+// touch this room *on this instance* even though it's already active
+// elsewhere in the cluster (see the "join" case for the metric-counting
+// creation path used by real participants).
+async function ensureLocalRoom(room: string): Promise<RoomInfo> {
+  let roomInfo = rooms.get(room);
+  if (roomInfo) return roomInfo;
+  const messages = await loadPersistedChat(room);
+  roomInfo = rooms.get(room);
+  if (roomInfo) return roomInfo;
+  roomInfo = { sockets: new Set(), createdAt: Date.now(), messages };
+  rooms.set(room, roomInfo);
+  if (CLUSTER_ENABLED) await subscribeRoom(room, makeClusterHandler(room));
+  return roomInfo;
+}
+
 // Cancels a pending scheduleRoomDeletion for `room`, if any — called
 // whenever someone (re)joins it, since that proves it didn't really empty
 // out for good.
@@ -333,18 +498,25 @@ function clearRoomDeletionTimer(room: string) {
 // reload/brief drop time to reconnect and reclaim it first.
 function scheduleRoomDeletion(room: string) {
   clearRoomDeletionTimer(room);
-  const timer = setTimeout(() => {
+  const timer = setTimeout(async () => {
     roomDeletionTimers.delete(room);
     const roomInfo = rooms.get(room);
-    if (roomInfo && roomInfo.sockets.size === 0) {
-      rooms.delete(room);
-      deletePersistedChat(room);
-    }
+    if (!roomInfo || roomInfo.sockets.size !== 0) return;
+    // The local cache/subscription only serves sockets on this instance —
+    // once there are none, it's cheap to tear down and recreate on the
+    // next local join, regardless of whether the room is still populated
+    // on another instance.
+    rooms.delete(room);
+    if (CLUSTER_ENABLED) await unsubscribeRoom(room);
+    // But the persisted chat is shared by the whole cluster — only wipe it
+    // once the room is empty *everywhere*, not just on this instance.
+    const globallyEmpty = CLUSTER_ENABLED ? await isRoomGloballyEmpty(room) : true;
+    if (globallyEmpty) deletePersistedChat(room);
   }, ROOM_DELETION_GRACE_MS);
   roomDeletionTimers.set(room, timer);
 }
 
-function leaveRoom(info: ClientInfo) {
+async function leaveRoom(info: ClientInfo) {
   if (!info.room) return;
   const room = info.room;
   const roomInfo = rooms.get(room);
@@ -363,6 +535,9 @@ function leaveRoom(info: ClientInfo) {
   info.sharing = false;
   info.mic = false;
   broadcastToRoom(room, { type: "peer-left", id: info.id }, info.socket);
+  if (CLUSTER_ENABLED) {
+    await Promise.all([removePeer(room, info.id), publishRoomEvent(room, instanceId, "peer-left", { id: info.id })]);
+  }
 }
 
 // Close code used when a second connection reclaims a client id out from
@@ -389,8 +564,12 @@ function detachSession(info: ClientInfo) {
       // the room's last socket: the new connection taking over this
       // identity is about to "join" the same room again, and will reload
       // this exact history from disk when it recreates the RoomInfo.
-      if (roomInfo.sockets.size === 0) rooms.delete(info.room);
+      if (roomInfo.sockets.size === 0) {
+        rooms.delete(info.room);
+        if (CLUSTER_ENABLED) unsubscribeRoom(info.room);
+      }
     }
+    if (CLUSTER_ENABLED) removePeer(info.room, info.id);
     info.room = null;
   }
   if (info.name && namesInUse.get(info.name.toLowerCase()) === info.socket) {
@@ -415,21 +594,27 @@ function disconnectClientsByIp(ip: string) {
   }
 }
 
-export function registerSignalingRoutes(app: FastifyInstance, genId: () => string) {
+export function registerSignalingRoutes(app: FastifyInstance, genId: () => string, id: string) {
+  instanceId = id;
+
+
   // Detects and reaps half-dead connections (network dropped without a clean
   // close, e.g. mobile network handoff, sleeping laptop, NAT/proxy silently
   // dropping an idle socket). Without this, a client can vanish for other
   // peers with no "peer-left" until the OS eventually notices the TCP
   // connection is gone, which can take minutes — the pings also generate
   // periodic traffic that keeps idle-timeout proxies from killing the
-  // connection in the first place.
-  const heartbeat = setInterval(() => {
+  // connection in the first place. Doubles, when clustered, as the
+  // heartbeat that refreshes this instance's peers in Redis and sweeps out
+  // any other instance's peers that went stale (see STALE_PEER_AFTER_MS).
+  heartbeatTimer = setInterval(() => {
     const now = Date.now();
     for (const [targetId, queue] of pendingSignals) {
       const fresh = queue.filter((item) => now - item.queuedAt <= PENDING_SIGNAL_TTL_MS);
       if (fresh.length === 0) pendingSignals.delete(targetId);
       else if (fresh.length !== queue.length) pendingSignals.set(targetId, fresh);
     }
+    const refreshEntries: Array<{ room: string; peer: Omit<RemotePeer, "lastSeen"> }> = [];
     for (const info of clients.values()) {
       if (!info.isAlive) {
         heartbeatReapedTotal.inc();
@@ -438,11 +623,18 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       }
       info.isAlive = false;
       info.socket.ping();
+      if (CLUSTER_ENABLED && info.room) {
+        refreshEntries.push({ room: info.room, peer: toRemotePeer(info) });
+      }
+    }
+    if (CLUSTER_ENABLED) {
+      refreshPeers(refreshEntries);
+      sweepStalePeers(STALE_PEER_AFTER_MS);
     }
   }, HEARTBEAT_INTERVAL_MS);
 
   app.addHook("onClose", (_instance, done) => {
-    clearInterval(heartbeat);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     done();
   });
 
@@ -451,6 +643,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // or peer detail, so it can't be used to discover a private room's
   // existence the way /admin/rooms can.
   app.get("/stats", async () => {
+    if (CLUSTER_ENABLED) {
+      const aggregate = await getAggregateRooms();
+      let peopleOnline = 0;
+      for (const { peers } of aggregate) peopleOnline += realPeopleCountFromPeers(peers);
+      return { peopleOnline };
+    }
     let peopleOnline = 0;
     for (const info of rooms.values()) peopleOnline += realPeopleCount(info);
     return { peopleOnline };
@@ -459,7 +657,21 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // Public room directory. Private rooms (handle starts with "priv-") are
   // filtered out here, server-side — the client never receives them, so
   // there's no separate access-control step to forget on the frontend.
+  // Sourced from Redis when clustered so this answers the same regardless
+  // of which instance the load balancer happens to route the request to.
   app.get("/rooms", async () => {
+    if (CLUSTER_ENABLED) {
+      const aggregate = await getAggregateRooms();
+      const publicRooms = aggregate
+        .filter(({ handle }) => !isPrivateRoom(handle))
+        .map(({ handle, createdAt, peers }) => ({
+          handle,
+          peopleCount: realPeopleCountFromPeers(peers),
+          createdAt,
+        }))
+        .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
+      return { rooms: publicRooms };
+    }
     const publicRooms = [...rooms.entries()]
       .filter(([handle]) => !isPrivateRoom(handle))
       .map(([handle, info]) => ({
@@ -528,6 +740,21 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   app.get("/admin/rooms", async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
+    }
+    if (CLUSTER_ENABLED) {
+      const aggregate = await getAggregateRooms();
+      const allRooms = aggregate
+        .map(({ handle, createdAt, peers }) => ({
+          handle,
+          isPrivate: isPrivateRoom(handle),
+          createdAt,
+          peopleCount: realPeopleCountFromPeers(peers),
+          peers: peers
+            .filter((p) => !p.role)
+            .map((p) => ({ id: p.id, name: p.name, sharing: p.sharing, mic: p.mic })),
+        }))
+        .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
+      return { rooms: allRooms };
     }
     const allRooms = [...rooms.entries()]
       .map(([handle, info]) => ({
@@ -814,6 +1041,10 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // without this their peer list would keep showing the old name.
           if (info.room && previousName && previousName !== rawName) {
             broadcastToRoom(info.room, { type: "peer-renamed", id: info.id, name: rawName }, socket);
+            if (CLUSTER_ENABLED) {
+              upsertPeer(info.room, toRemotePeer(info));
+              publishRoomEvent(info.room, instanceId, "peer-renamed", { id: info.id, name: rawName });
+            }
           }
           break;
         }
@@ -848,20 +1079,24 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
             }
           }
+          // subscribeRoom is idempotent (no-ops if already subscribed), so
+          // it's safe to call on every join regardless of whether this
+          // particular call is the one that created the local RoomInfo.
+          if (CLUSTER_ENABLED) await subscribeRoom(room, makeClusterHandler(room));
           // The await above gave this socket's own "leave"/another "join"
           // a chance to run first and move it elsewhere (or the socket
           // could've closed outright) — don't add it to a room it's no
           // longer trying to join.
           if (info.room !== room || !clients.has(socket)) return;
           roomInfo.sockets.add(socket);
-          const peers = [...roomInfo.sockets]
-            .filter((s) => s !== socket)
-            .map((s) => clients.get(s))
-            .filter((c): c is ClientInfo => c !== undefined)
-            .map(peerSummary);
+          if (CLUSTER_ENABLED) await upsertPeer(room, toRemotePeer(info));
+          const peers = await getRoomPeers(room, info.id, roomInfo);
           send(socket, { type: "room-state", room, selfId: info.id, peers, messages: roomInfo.messages });
           flushPendingSignals(info);
           broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name }, socket);
+          if (CLUSTER_ENABLED) {
+            publishRoomEvent(room, instanceId, "peer-joined", { id: info.id, name: info.name });
+          }
           break;
         }
         // A moderator entering a room to watch/listen for moderation.
@@ -886,8 +1121,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             send(socket, { type: "error", message: "Sala inválida." });
             return;
           }
-          const roomInfo = rooms.get(room);
-          if (!roomInfo) {
+          // A room can be active on another instance without this one ever
+          // having seen a local socket for it — check globally, not just
+          // this instance's local cache, before declaring it gone.
+          const existsLocally = rooms.has(room);
+          const existsGlobally = CLUSTER_ENABLED ? !(await isRoomGloballyEmpty(room)) : existsLocally;
+          if (!existsLocally && !existsGlobally) {
             send(socket, { type: "error", message: "Sala não encontrada ou já encerrada." });
             return;
           }
@@ -898,12 +1137,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           info.room = room;
           info.sharing = false;
           info.mic = false;
+          const roomInfo = await ensureLocalRoom(room);
+          // Mirrors "join": the await above could let this socket move
+          // elsewhere or close outright — don't add it to a room it's no
+          // longer trying to join.
+          if (info.room !== room || !clients.has(socket)) return;
           roomInfo.sockets.add(socket);
-          const adminPeers = [...roomInfo.sockets]
-            .filter((s) => s !== socket)
-            .map((s) => clients.get(s))
-            .filter((c): c is ClientInfo => c !== undefined)
-            .map(peerSummary);
+          if (CLUSTER_ENABLED) await upsertPeer(room, toRemotePeer(info));
+          const adminPeers = await getRoomPeers(room, info.id, roomInfo);
           send(socket, {
             type: "room-state",
             room,
@@ -913,6 +1154,9 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           });
           flushPendingSignals(info);
           broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name, role: "moderator" }, socket);
+          if (CLUSTER_ENABLED) {
+            publishRoomEvent(room, instanceId, "peer-joined", { id: info.id, name: info.name, role: "moderator" });
+          }
           break;
         }
         case "leave": {
@@ -923,12 +1167,20 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           if (!info.room) return;
           info.sharing = Boolean(msg.sharing);
           broadcastToRoom(info.room, { type: "peer-sharing", id: info.id, sharing: info.sharing });
+          if (CLUSTER_ENABLED) {
+            upsertPeer(info.room, toRemotePeer(info));
+            publishRoomEvent(info.room, instanceId, "peer-sharing", { id: info.id, sharing: info.sharing });
+          }
           break;
         }
         case "mic": {
           if (!info.room) return;
           info.mic = Boolean(msg.mic);
           broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
+          if (CLUSTER_ENABLED) {
+            upsertPeer(info.room, toRemotePeer(info));
+            publishRoomEvent(info.room, instanceId, "peer-mic", { id: info.id, mic: info.mic });
+          }
           break;
         }
         case "chat": {
@@ -974,6 +1226,9 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           }
           savePersistedChat(info.room, roomInfo.messages);
           broadcastToRoom(info.room, { type: "chat-message", ...chatMessage });
+          if (CLUSTER_ENABLED) {
+            publishRoomEvent(info.room, instanceId, "chat-message", chatMessage);
+          }
           break;
         }
         case "signal": {
@@ -1008,4 +1263,27 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       clients.delete(socket);
     });
   });
+}
+
+// Called from index.ts on SIGTERM/SIGINT. Tells every locally-connected
+// client the process is about to go away (so the browser-side reconnect
+// logic can act immediately instead of waiting to notice the socket died),
+// then cleans up this instance's room presence and closes each socket with
+// close code 1012 ("Service Restart") so it reads as an intentional,
+// reconnect-worthy close rather than a network failure.
+export async function shutdownSignaling(): Promise<void> {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+  const infos = [...clients.values()];
+  for (const info of infos) {
+    send(info.socket, { type: "server-shutdown" });
+  }
+  await Promise.all(
+    infos.map(async (info) => {
+      if (info.room) await leaveRoom(info);
+      info.socket.close(1012, "server-shutting-down");
+    })
+  );
 }
