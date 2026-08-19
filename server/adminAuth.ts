@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 
+
 // Left unset by default — the whole /admin surface (routes + the WS
 // admin-join path in signaling.ts) stays disabled until both are configured,
 // so a deployment never accidentally ships a moderation backdoor with empty
