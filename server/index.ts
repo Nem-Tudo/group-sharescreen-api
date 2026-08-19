@@ -44,7 +44,7 @@ async function main() {
   // this server.
   await app.register(cors, {
     origin: true,
-    methods: ["GET", "HEAD", "POST", "PUT", "DELETE"],
+    methods: ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"],
     allowedHeaders: "*",
     exposedHeaders: "*",
   });
