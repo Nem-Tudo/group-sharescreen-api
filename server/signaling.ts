@@ -654,7 +654,9 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           roomInfo.sockets.add(socket);
           const peers = [...roomInfo.sockets]
             .filter((s) => s !== socket)
-            .map((s) => peerSummary(clients.get(s)!));
+            .map((s) => clients.get(s))
+            .filter((c): c is ClientInfo => c !== undefined)
+            .map(peerSummary);
           send(socket, { type: "room-state", room, selfId: info.id, peers, messages: roomInfo.messages });
           flushPendingSignals(info);
           broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name }, socket);
@@ -700,7 +702,9 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           roomInfo.sockets.add(socket);
           const adminPeers = [...roomInfo.sockets]
             .filter((s) => s !== socket)
-            .map((s) => peerSummary(clients.get(s)!));
+            .map((s) => clients.get(s))
+            .filter((c): c is ClientInfo => c !== undefined)
+            .map(peerSummary);
           send(socket, {
             type: "room-state",
             room,
