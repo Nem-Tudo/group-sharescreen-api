@@ -10,7 +10,11 @@ import {
   signalsRelayedTotal,
   bannedIpConnectionsRejectedTotal,
   chatMessagesBlockedTotal,
+  autoBansTotal,
+  turnstileVerificationsTotal,
 } from "./metrics.js";
+import { recordViolation } from "./rateLimiter.js";
+import { verifyTurnstileToken, TURNSTILE_ENABLED } from "./turnstile.js";
 import { signToken, verifyToken, requireAdmin } from "./auth.js";
 import {
   createAccount,
@@ -72,6 +76,24 @@ const PARTNER_TITLE_MAX_LEN = 80;
 const PARTNER_DESCRIPTION_MAX_LEN = 400;
 const PARTNER_BUTTON_LABEL_MAX_LEN = 40;
 const BAN_REASON_MAX_LEN = 200;
+// How many rate-limit violations (across chat/join/register combined) the
+// same IP can rack up before it's treated as automated abuse rather than one
+// over-eager human and auto-banned the same way an admin doing it by hand
+// would (see banIp/disconnectClientsByIp) — this is what actually stops a
+// bot that just keeps reconnecting/retrying after being rate-limited.
+const AUTO_BAN_VIOLATION_LIMIT = 6;
+const AUTO_BAN_VIOLATION_WINDOW_MS = 60_000;
+const AUTO_BAN_DURATION_MINUTES = 60;
+// How long a passed Turnstile challenge is remembered per connection (see
+// ClientInfo.turnstileVerifiedAt) before the next join requires a fresh one
+// again — without an expiry, a single solved challenge would cover that
+// connection's joins forever (a WS socket doesn't expire on its own, and a
+// scripted client answers heartbeat pings same as a browser), letting a bot
+// pay for one challenge and then spam indefinitely at just-under-rate-limit
+// pace without ever tripping the auto-ban above. 10 minutes comfortably
+// covers a real person hopping between a few rooms in one sitting while
+// still capping how long one solve keeps paying off for a bot.
+const TURNSTILE_REVERIFY_INTERVAL_MS = 10 * 60_000;
 // Close code used to reject a connection from a banned IP — distinct from
 // SUPERSEDED_CLOSE_CODE below so the client can tell them apart and show the
 // right message instead of quietly retrying (see signalingClient.ts).
@@ -140,6 +162,13 @@ interface ClientInfo {
   // what admin-join checks in place of a separate admin token system.
   accountId?: string;
   flags?: string[];
+  // Timestamp of the last passed Turnstile challenge on this connection —
+  // later joins on the *same* socket (switching rooms) skip re-verifying as
+  // long as it's within TURNSTILE_REVERIFY_INTERVAL_MS. Deliberately
+  // per-connection, not persisted anywhere: a new socket (reload, reconnect)
+  // always starts unverified, since that's exactly the moment a bot would
+  // use to open a fresh connection and dodge the check.
+  turnstileVerifiedAt?: number;
   // Every non-account connection gets a guest identity (see "register"
   // below) — either freshly minted for this connection, or recovered from a
   // guest token the client already had. `guestVerified` is what separates
@@ -835,6 +864,27 @@ function disconnectClientsByIp(ip: string) {
   }
 }
 
+// Tracks rate-limit *violations* (not hits — those are already counted by
+// consumeRateLimit/wsRateLimitedTotal in rateLimiter.ts) for the categories
+// that actually indicate spam (chat/join/register — as opposed to
+// signal/toggle bursts, which are normal WebRTC/UI behavior and dropped
+// silently by design). If the same IP crosses AUTO_BAN_VIOLATION_LIMIT
+// violations within AUTO_BAN_VIOLATION_WINDOW_MS, it's auto-banned exactly
+// like an admin ban (persisted, disconnects every socket from that IP
+// immediately). Fire-and-forget on the ban itself since this runs on the hot
+// message-handling path.
+function recordRateLimitViolation(info: ClientInfo) {
+  if (!recordViolation(info.ip, AUTO_BAN_VIOLATION_LIMIT, AUTO_BAN_VIOLATION_WINDOW_MS)) return;
+  autoBansTotal.inc();
+  void banIp(
+    info.ip,
+    "Bloqueio automático: excesso de mensagens (possível bot de spam)",
+    AUTO_BAN_DURATION_MINUTES
+  )
+    .then(() => disconnectClientsByIp(info.ip))
+    .catch(() => {});
+}
+
 export async function registerSignalingRoutes(app: FastifyInstance, genId: () => string) {
   // Restores whatever topwarn was active before this process last
   // restarted (deploy, crash) — see announcementStore.ts. Awaited before any
@@ -1351,6 +1401,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // getting in the way of a real, occasional name change.
           if (!(await consumeRateLimit(wsRegisterLimiter, info.rateLimitKey, "register"))) {
             send(socket, { type: "register-error", message: "Muitas tentativas. Aguarde um instante." });
+            recordRateLimitViolation(info);
             return;
           }
           // A logged-in client passes its account JWT here; a guest passes
@@ -1521,6 +1572,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // real connection does rarely, never in a tight loop.
           if (!(await consumeRateLimit(wsJoinLimiter, info.rateLimitKey, "join"))) {
             send(socket, { type: "join-error", message: "Muitas tentativas. Aguarde um instante." });
+            recordRateLimitViolation(info);
             return;
           }
           if (!info.name) {
@@ -1533,6 +1585,37 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             return;
           }
           if (info.room === room) return;
+
+          // Gates the join itself — this is also how a room gets *created*
+          // in this codebase (the first join creates it), so this is the
+          // one checkpoint that covers both "someone spun up a new room"
+          // and "someone joined an existing one". Skipped if this connection
+          // already passed it recently (info.turnstileVerifiedAt — see
+          // ClientInfo and TURNSTILE_REVERIFY_INTERVAL_MS) so switching
+          // rooms doesn't re-challenge someone freshly verified on this same
+          // socket, while still forcing a re-check periodically rather than
+          // trusting one solve for the connection's entire lifetime. Checked
+          // before touching any room state; async (a real network call to
+          // Cloudflare), so re-validate afterwards in case this socket moved
+          // on (closed, or a second "join" already landed — see the
+          // loadPersistedChat comment below for why that's possible).
+          const turnstileStillFresh =
+            info.turnstileVerifiedAt !== undefined &&
+            Date.now() - info.turnstileVerifiedAt < TURNSTILE_REVERIFY_INTERVAL_MS;
+          if (TURNSTILE_ENABLED && !turnstileStillFresh) {
+            const token = typeof msg.turnstileToken === "string" ? msg.turnstileToken : "";
+            const verified = await verifyTurnstileToken(token, info.ip);
+            turnstileVerificationsTotal.inc({ result: verified ? "success" : "failure" });
+            if (!verified) {
+              send(socket, {
+                type: "turnstile-required",
+                message: "Verificação de segurança necessária para entrar na sala.",
+              });
+              return;
+            }
+            info.turnstileVerifiedAt = Date.now();
+            if (!clients.has(socket) || info.room === room) return;
+          }
 
           // A name already held by someone else in *this* room is only ever
           // let through when it's provably the same guest/account already
@@ -1690,6 +1773,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               type: "chat-blocked",
               message: "Você está enviando mensagens rápido demais. Aguarde um instante.",
             });
+            recordRateLimitViolation(info);
             return;
           }
           const isGif = msg.kind === "gif";

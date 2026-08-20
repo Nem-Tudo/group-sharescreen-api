@@ -238,3 +238,16 @@ export const wsRateLimitedTotal = new Counter({
   labelNames: ["kind"],
   registers: [register],
 });
+
+export const autoBansTotal = new Counter({
+  name: "sharescreen_auto_bans_total",
+  help: "IP bans issued automatically after repeated rate-limit violations (as opposed to an admin banning by hand)",
+  registers: [register],
+});
+
+export const turnstileVerificationsTotal = new Counter({
+  name: "sharescreen_turnstile_verifications_total",
+  help: "Cloudflare Turnstile token verifications performed on room join, by result",
+  labelNames: ["result"],
+  registers: [register],
+});
