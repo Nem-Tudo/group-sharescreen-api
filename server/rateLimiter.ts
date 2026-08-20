@@ -23,10 +23,11 @@ import { wsRateLimitedTotal } from "./metrics.js";
 // anything the per-type limiters below don't (e.g. a flood of an unknown
 // `type`, which never reaches any of them), without constraining normal
 // mixed traffic. Must stay comfortably above wsSignalLimiter's own ceiling
-// (700/5s) or it — not the signal-specific limiter — would end up being the
-// thing that throttles a big room's join burst, which defeats the point of
-// sizing that one generously.
-export const wsGlobalLimiter = new RateLimiterMemory({ points: 1500, duration: 10 });
+// (1500/5s, i.e. up to 3000 across this limiter's own 10s window) or it —
+// not the signal-specific limiter — would end up being the thing that
+// throttles a big room's join burst, which defeats the point of sizing
+// that one generously.
+export const wsGlobalLimiter = new RateLimiterMemory({ points: 3500, duration: 10 });
 
 // "register" covers both the initial name registration and every rename
 // after (renaming doesn't go through "join" again — see signaling.ts). A
@@ -47,17 +48,21 @@ export const wsChatLimiter = new RateLimiterMemory({ points: 8, duration: 5 });
 // legitimate-traffic category: this app opens one send/recv RTCPeerConnection
 // *per peer* rather than a single bidirectional one (see useRoomMedia.ts),
 // so starting a share fans out an offer plus several trickled ICE candidates
-// to every other participant, nearly simultaneously — and that fan-out
-// multiplies again if TURN relay candidates are in play (see iceConfig.ts)
-// or someone shares both mic and screen at once. Sized with a lot of room
-// above a large call (700/5s comfortably covers a several-dozen-person room
-// even in the worst-case candidate count) precisely because a dropped
-// offer/answer here isn't retried anywhere (unlike an offline-peer signal,
-// which deliverOrQueueSignal queues) — it just silently fails to connect
-// that one peer, so the cost of this being too tight is much worse than the
-// cost of it being generous. Still a real backstop against a
-// runaway/malicious client, just not a normal-usage limiter.
-export const wsSignalLimiter = new RateLimiterMemory({ points: 700, duration: 5 });
+// to every other participant — and that fan-out multiplies again if TURN
+// relay candidates are in play (see iceConfig.ts) or someone shares both
+// mic and screen at once. The client now spaces those opens out over time
+// instead of firing them all in the same instant (see useRoomMedia.ts's
+// openSendPCsStaggered/STAGGER_MS — a 50-person room's burst spreads across
+// several seconds now, not one), which is what actually keeps a big room
+// under this; the points value below is just extra headroom on top of
+// that, sized generously because a dropped offer/answer here isn't retried
+// anywhere near as reliably as other traffic (an offline-peer signal at
+// least gets queued by deliverOrQueueSignal — this doesn't) — it just
+// silently fails to connect that one peer, so the cost of this being too
+// tight is much worse than the cost of it being generous. Still a real
+// backstop against a runaway/malicious client, just not a normal-usage
+// limiter.
+export const wsSignalLimiter = new RateLimiterMemory({ points: 1500, duration: 5 });
 
 // "sharing" / "mic" toggles — occasional user-driven UI actions, but cheap
 // enough to allow a bit of rapid double-toggling without dropping it.
