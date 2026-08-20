@@ -64,6 +64,25 @@ function isPrivateRoom(room: string): boolean {
   return room.startsWith(PRIVATE_PREFIX);
 }
 
+// A non-updated ("old format") client — and any guest before its very first
+// guest-token round-trip — never presents a token at all, so the only thing
+// it can offer to reclaim a stale connection is the plain clientId it was
+// given (see the "register" handler's existingProtected check below). That
+// bare match is inherently spoofable by anyone who has merely seen that id
+// (it's visible in every room's peer list), which is exactly the attack the
+// token system exists to close — but *only once a session has actually
+// verified a token*. Set this to "false" to close that residual gap
+// entirely: reclaiming an existing session then always requires proving it
+// via a matching account/guest token (see isSameOwner), full stop. The
+// trade-off is that a non-updated client — which will never have such a
+// token to present — loses seamless reconnect: a reload or a rename no
+// longer reclaims its old spot, it just starts over as a new guest each
+// time. Registration itself is never refused either way; this only governs
+// how strictly *reclaiming* an existing one is guarded. Defaults to "true"
+// so existing, non-updated clients keep working exactly as they always
+// have.
+const ALLOW_OLD_CLIENTS_GUEST_SYSTEM = process.env.ALLOW_OLD_CLIENTS_GUEST_SYSTEM !== "false";
+
 interface ClientInfo {
   id: string;
   name: string | null;
@@ -93,12 +112,49 @@ interface ClientInfo {
   // what admin-join checks in place of a separate admin token system.
   accountId?: string;
   flags?: string[];
+  // Every non-account connection gets a guest identity (see "register"
+  // below) — either freshly minted for this connection, or recovered from a
+  // guest token the client already had. `guestVerified` is what separates
+  // the two: true only when `guestId` came from a token this connection
+  // actually presented (proof it's the same guest as before), false when it
+  // was just made up now because nothing was presented. That distinction is
+  // the whole point of isSameOwner below — a freshly-made-up id never
+  // matches anyone else's, guessed or not, so it can't be used to claim
+  // someone else's session.
+  guestId?: string;
+  guestVerified?: boolean;
 }
 
 interface RoomInfo {
   sockets: Set<WebSocket>;
   createdAt: number;
   messages: ChatMessage[];
+  // Room-scoped display-name reservations — separate from any other room,
+  // so the same name can be used freely in two different rooms at once (see
+  // isSameOwner and the "join"/"register" handlers). Keyed the same way the
+  // old global `namesInUse` map used to be (lowercased name -> holder).
+  names: Map<string, WebSocket>;
+}
+
+// Whether `challenger` may take over `existing`'s session/room slot — used
+// wherever that has to be told apart from a stranger merely presenting the
+// same display name or a guessed/observed connection id (see the "register"
+// and "join" handlers). Only `challenger`'s side of the proof matters: for
+// an account, its accountId (always proven — it only ever comes from a
+// verified account JWT); for a guest, a *verified* guestId matching
+// `existing`'s (proven by having just presented the exact token that was
+// privately handed to whoever `existing` is — nobody else could produce
+// it). `existing` itself doesn't need to be verified — plenty of live
+// sessions never re-prove themselves after their first connection, and
+// that's fine, since it's `challenger` making the claim here. What must
+// never count is an *unverified* guestId on the challenger's side, freshly
+// made up for this connection: unlike a verified one, that proves nothing
+// about who's on the other end.
+function isSameOwner(existing: ClientInfo, challenger: ClientInfo): boolean {
+  if (existing.accountId || challenger.accountId) {
+    return Boolean(challenger.accountId) && existing.accountId === challenger.accountId;
+  }
+  return Boolean(challenger.guestVerified) && existing.guestId === challenger.guestId;
 }
 
 type AnnouncementButtonAction = "open-new-tab" | "open-same-tab" | "reload";
@@ -122,7 +178,6 @@ interface Announcement {
 
 const clients = new Map<WebSocket, ClientInfo>();
 const clientsById = new Map<string, ClientInfo>();
-const namesInUse = new Map<string, WebSocket>();
 const rooms = new Map<string, RoomInfo>();
 // Pending "really delete this now-empty room" timers, keyed by room — see
 // scheduleRoomDeletion.
@@ -156,16 +211,26 @@ const PENDING_SIGNAL_TTL_MS = 15_000;
 const MAX_PENDING_SIGNALS_PER_TARGET = 32;
 const pendingSignals = new Map<string, PendingSignal[]>();
 
-registerStatsProvider(() => ({
-  connectedSockets: clients.size,
-  registeredPeers: [...clients.values()].filter((c) => c.name !== null && !c.isModerator).length,
-  rooms: [...rooms.entries()].map(([handle, info]) => ({
-    handle,
-    peopleCount: realPeopleCount(info),
-    sharingCount: realSharingCount(info),
-    isPrivate: isPrivateRoom(handle),
-  })),
-}));
+registerStatsProvider(() => {
+  const registeredPeers = [...clients.values()].filter((c) => c.name !== null && !c.isModerator);
+  const identities = { accounts: 0, guestsWithToken: 0, guestsWithoutToken: 0 };
+  for (const c of registeredPeers) {
+    if (c.accountId) identities.accounts += 1;
+    else if (c.guestVerified) identities.guestsWithToken += 1;
+    else identities.guestsWithoutToken += 1;
+  }
+  return {
+    connectedSockets: clients.size,
+    registeredPeers: registeredPeers.length,
+    identities,
+    rooms: [...rooms.entries()].map(([handle, info]) => ({
+      handle,
+      peopleCount: realPeopleCount(info),
+      sharingCount: realSharingCount(info),
+      isPrivate: isPrivateRoom(handle),
+    })),
+  };
+});
 
 function isValidDisplayName(name: string): boolean {
   if (name.length < 1 || name.length > 24) return false;
@@ -350,6 +415,9 @@ function leaveRoom(info: ClientInfo) {
   const roomInfo = rooms.get(room);
   if (roomInfo) {
     roomInfo.sockets.delete(info.socket);
+    if (info.name && roomInfo.names.get(info.name.toLowerCase()) === info.socket) {
+      roomInfo.names.delete(info.name.toLowerCase());
+    }
     if (roomInfo.sockets.size === 0) {
       // The room *looks* empty, but don't wipe its chat history yet — see
       // scheduleRoomDeletion. (A same-identity reconnect that briefly
@@ -385,6 +453,9 @@ function detachSession(info: ClientInfo) {
     const roomInfo = rooms.get(info.room);
     if (roomInfo) {
       roomInfo.sockets.delete(info.socket);
+      if (info.name && roomInfo.names.get(info.name.toLowerCase()) === info.socket) {
+        roomInfo.names.delete(info.name.toLowerCase());
+      }
       // Deliberately leaves the persisted chat file alone even if this was
       // the room's last socket: the new connection taking over this
       // identity is about to "join" the same room again, and will reload
@@ -392,9 +463,6 @@ function detachSession(info: ClientInfo) {
       if (roomInfo.sockets.size === 0) rooms.delete(info.room);
     }
     info.room = null;
-  }
-  if (info.name && namesInUse.get(info.name.toLowerCase()) === info.socket) {
-    namesInUse.delete(info.name.toLowerCase());
   }
   if (clientsById.get(info.id) === info) clientsById.delete(info.id);
   clients.delete(info.socket);
@@ -739,47 +807,82 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
 
       switch (msg.type) {
         case "register": {
-          const rawName = typeof msg.name === "string" ? msg.name.trim().slice(0, 24) : "";
+          // A logged-in client passes its account JWT here; a guest passes
+          // whatever guest token a previous "registered" response handed it
+          // (see below) — same `token` field either way, told apart by the
+          // decoded payload's `guest` flag. Neither is required: an old
+          // client that only ever knew about plain names/clientIds sends
+          // nothing here and still works exactly as before.
+          const rawToken = typeof msg.token === "string" ? msg.token : "";
+          const authPayload = rawToken ? verifyToken(rawToken) : null;
+          const isAccountToken = Boolean(authPayload && !authPayload.guest);
+
+          // A logged-in account's display name always comes from its own
+          // account record, never from whatever the client sends alongside
+          // the token — otherwise `name` would be the one piece of identity
+          // info an account holder could still freely spoof despite a valid
+          // token, and it'd let the name drift from what the account
+          // actually shows elsewhere (e.g. the admin panel, chat history
+          // from other rooms). A guest has no such record, so its name
+          // stays exactly what it always was: whatever it types.
+          let rawName: string;
+          if (isAccountToken) {
+            const account = getPublicAccountById(authPayload!.sub);
+            if (!account) {
+              // The account behind this token doesn't exist anymore
+              // (deleted after the token was issued) — treat it like any
+              // other invalid token rather than trusting a name for an
+              // account that's gone.
+              registerErrorsTotal.inc();
+              send(socket, { type: "register-error", message: "Conta não encontrada." });
+              return;
+            }
+            rawName = account.displayName;
+          } else {
+            rawName = typeof msg.name === "string" ? msg.name.trim().slice(0, 24) : "";
+          }
           if (!isValidDisplayName(rawName)) {
             registerErrorsTotal.inc();
             send(socket, { type: "register-error", message: "Nome inválido." });
             return;
           }
 
-          // A client-supplied id (persisted client-side across reloads and
-          // reconnects) lets a returning client reclaim its previous
-          // identity instead of showing up as a stranger to everyone else's
-          // still-open peer connections. If a stale session under that id
-          // is still around (server restart wiped nothing since it's a
-          // fresh process, but a plain reconnect can race the heartbeat
-          // reaper), take it over cleanly first.
-          // A logged-in client passes its JWT here so the rest of this
-          // session (the reserved-name check right below, admin checks,
-          // etc) can trust info.accountId instead of re-verifying a token
-          // on every message.
-          const rawToken = typeof msg.token === "string" ? msg.token : "";
-          const authPayload = rawToken ? verifyToken(rawToken) : null;
-
-          const requestedClientId = typeof msg.clientId === "string" ? msg.clientId : "";
-          const clientId = CLIENT_ID_RE.test(requestedClientId) ? requestedClientId : null;
-          const existingById = clientId ? clientsById.get(clientId) : undefined;
-          if (existingById && existingById.socket !== socket) {
-            detachSession(existingById);
+          let newGuestToken: string | null = null;
+          if (isAccountToken) {
+            info.accountId = authPayload!.sub;
+            info.flags = authPayload!.flags;
+            info.guestId = undefined;
+            info.guestVerified = false;
+          } else {
+            info.accountId = undefined;
+            info.flags = undefined;
+            if (authPayload && authPayload.guest) {
+              info.guestId = authPayload.sub;
+              info.guestVerified = true;
+            } else if (!info.guestId) {
+              // No usable token presented: mint a fresh, unverified guest
+              // identity for this connection and hand back a token for it,
+              // so the client can prove it's still the same guest next time
+              // (see isSameOwner). Every connection that shows up without a
+              // token gets its own distinct id here — that's what stops a
+              // stranger from reusing this guest's publicly-visible name or
+              // connection id to hijack the session below or in "join": they
+              // can never produce a matching *verified* guestId.
+              info.guestId = `guest:${genId()}`;
+              info.guestVerified = false;
+            }
+            if (!info.guestVerified) {
+              newGuestToken = signToken({ sub: info.guestId!, username: rawName, flags: [], guest: true });
+            }
           }
 
           const key = rawName.toLowerCase();
-          const existingByName = namesInUse.get(key);
-          if (existingByName && existingByName !== socket) {
-            registerErrorsTotal.inc();
-            send(socket, { type: "register-error", message: "Esse nome já está em uso." });
-            return;
-          }
           // A name tied to a registered account (its username or display
           // name) is reserved for that account's owner — anyone else, guest
           // or a different account, trying to register under it gets
-          // rejected the same as an already-in-use name above.
+          // rejected.
           const reservedOwnerId = isNameReserved(key);
-          if (reservedOwnerId && reservedOwnerId !== authPayload?.sub) {
+          if (reservedOwnerId && reservedOwnerId !== info.accountId) {
             registerErrorsTotal.inc();
             send(socket, {
               type: "register-error",
@@ -787,16 +890,63 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             });
             return;
           }
-          const previousName = info.name;
-          if (info.name) namesInUse.delete(info.name.toLowerCase());
-          info.name = rawName;
-          namesInUse.set(key, socket);
-          info.accountId = authPayload?.sub;
-          info.flags = authPayload?.flags;
 
+          // Renaming while already in a room doesn't go through "join"
+          // again, so the room-scoped name collision "join" normally checks
+          // (see below) has to be checked here instead — the same name
+          // could already be held by someone else in *this* room.
+          if (info.room) {
+            const roomInfo = rooms.get(info.room);
+            const holderSocket = roomInfo?.names.get(key);
+            const holder = holderSocket && holderSocket !== socket ? clients.get(holderSocket) : undefined;
+            if (holder && !isSameOwner(holder, info)) {
+              registerErrorsTotal.inc();
+              send(socket, { type: "register-error", message: "Esse nome já está em uso nesta sala." });
+              return;
+            }
+          }
+
+          const previousName = info.name;
+          info.name = rawName;
+          if (info.room) {
+            const roomInfo = rooms.get(info.room);
+            if (roomInfo) {
+              if (previousName) roomInfo.names.delete(previousName.toLowerCase());
+              roomInfo.names.set(key, socket);
+            }
+          }
+
+          // A client-supplied id (persisted client-side across reloads) lets
+          // a returning client reclaim its previous connection id instead of
+          // showing up as a stranger to everyone else's still-open peer
+          // connections. Only actually reclaimed if it's free, already ours,
+          // or provably the same owner as whoever currently holds it —
+          // otherwise someone merely guessing/observing another live
+          // connection's id (it's visible to every peer in its room) could
+          // hijack that session by presenting it back. A session that was
+          // never given a chance to prove itself (no token ever verified for
+          // it — the old, pre-token model) still trusts a bare id match by
+          // default, to keep working exactly as it always has for clients
+          // that don't know about tokens at all — see
+          // ALLOW_OLD_CLIENTS_GUEST_SYSTEM.
+          const requestedClientId = typeof msg.clientId === "string" ? msg.clientId : "";
+          const clientId = CLIENT_ID_RE.test(requestedClientId) ? requestedClientId : null;
           if (clientId && clientId !== info.id) {
-            if (clientsById.get(info.id) === info) clientsById.delete(info.id);
-            info.id = clientId;
+            const existingById = clientsById.get(clientId);
+            if (!existingById) {
+              if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+              info.id = clientId;
+            } else if (existingById.socket !== socket) {
+              const existingProtected =
+                !ALLOW_OLD_CLIENTS_GUEST_SYSTEM || Boolean(existingById.accountId) || existingById.guestVerified;
+              if (!existingProtected || isSameOwner(existingById, info)) {
+                detachSession(existingById);
+                if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+                info.id = clientId;
+              }
+              // else: someone else's protected session — ignore the
+              // requested id and keep our own freshly generated one.
+            }
           }
           clientsById.set(info.id, info);
 
@@ -804,9 +954,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             type: "registered",
             id: info.id,
             name: rawName,
-            account: authPayload
-              ? { username: authPayload.username, flags: authPayload.flags }
-              : null,
+            account: info.accountId ? { username: authPayload!.username, flags: info.flags ?? [] } : null,
+            // Only sent when non-null — a guest whose existing token was
+            // just verified above doesn't need a new one. A client that
+            // doesn't understand this field simply ignores it, same as any
+            // other unrecognized field.
+            guestToken: newGuestToken,
           });
 
           // Renaming while already in a room doesn't go through "join"
@@ -828,6 +981,30 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             return;
           }
           if (info.room === room) return;
+
+          // A name already held by someone else in *this* room is only ever
+          // let through when it's provably the same guest/account already
+          // there under another connection (a second tab, or a reload that
+          // hasn't reclaimed its old connection id yet) — reclaiming just
+          // takes over the slot instead of rejecting, same as a plain
+          // clientId collision does in "register". Two different rooms
+          // never collide this way (this check is scoped to `room` alone),
+          // and a stranger presenting the same name they can see in the
+          // room's peer list is turned away without touching the person
+          // already there.
+          const nameKey = info.name.toLowerCase();
+          const existingRoomInfo = rooms.get(room);
+          const holderSocket = existingRoomInfo?.names.get(nameKey);
+          if (holderSocket && holderSocket !== socket) {
+            const holder = clients.get(holderSocket);
+            if (holder && isSameOwner(holder, info)) {
+              detachSession(holder);
+            } else {
+              send(socket, { type: "join-error", message: "Esse nome já está em uso nesta sala." });
+              return;
+            }
+          }
+
           if (info.room) leaveRoom(info);
           clearRoomDeletionTimer(room);
           info.room = room;
@@ -843,7 +1020,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             const messages = await loadPersistedChat(room);
             roomInfo = rooms.get(room);
             if (!roomInfo) {
-              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages };
+              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages, names: new Map() };
               rooms.set(room, roomInfo);
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
             }
@@ -854,6 +1031,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // longer trying to join.
           if (info.room !== room || !clients.has(socket)) return;
           roomInfo.sockets.add(socket);
+          roomInfo.names.set(nameKey, socket);
           const peers = [...roomInfo.sockets]
             .filter((s) => s !== socket)
             .map((s) => clients.get(s))
@@ -995,12 +1173,11 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
 
     socket.on("close", () => {
       wsDisconnectionsTotal.inc();
+      // leaveRoom guards its own roomInfo.names cleanup against a
+      // stale/superseded session's delayed close event wiping out a newer
+      // reconnect that already took over this name/id (it only ever deletes
+      // its *own* socket's reservation).
       if (info.room) leaveRoom(info);
-      // Guard against a stale/superseded session's delayed close event
-      // wiping out a newer reconnect that already took over this name/id.
-      if (info.name && namesInUse.get(info.name.toLowerCase()) === socket) {
-        namesInUse.delete(info.name.toLowerCase());
-      }
       if (clientsById.get(info.id) === info) {
         clientsById.delete(info.id);
         pendingSignals.delete(info.id);

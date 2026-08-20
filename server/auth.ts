@@ -18,6 +18,12 @@ export interface JwtPayload {
   sub: string;
   username: string;
   flags: string[];
+  // True for a guest identity token (see signaling.ts's "register" handler)
+  // rather than a registered account — same signing/verification path as an
+  // account token, this flag is what lets a caller tell the two apart. A
+  // guest's `sub` is a randomly generated id (never a real account id), and
+  // its `flags` is always empty.
+  guest?: boolean;
 }
 
 export function signToken(payload: JwtPayload): string {
@@ -29,11 +35,16 @@ export function verifyToken(token: string | null | undefined): JwtPayload | null
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (typeof decoded !== "object" || decoded === null) return null;
-    const { sub, username, flags } = decoded as Record<string, unknown>;
+    const { sub, username, flags, guest } = decoded as Record<string, unknown>;
     if (typeof sub !== "string" || typeof username !== "string" || !Array.isArray(flags)) {
       return null;
     }
-    return { sub, username, flags: flags.filter((f): f is string => typeof f === "string") };
+    return {
+      sub,
+      username,
+      flags: flags.filter((f): f is string => typeof f === "string"),
+      guest: guest === true,
+    };
   } catch {
     return null;
   }
