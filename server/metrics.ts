@@ -225,3 +225,17 @@ export const chatMessagesBlockedTotal = new Counter({
   help: "Chat messages blocked by the banned-words filter",
   registers: [register],
 });
+
+export const httpRateLimitedTotal = new Counter({
+  name: "sharescreen_http_rate_limited_total",
+  help: "HTTP requests rejected by @fastify/rate-limit (429), by route",
+  labelNames: ["route"],
+  registers: [register],
+});
+
+export const wsRateLimitedTotal = new Counter({
+  name: "sharescreen_ws_rate_limited_total",
+  help: "WebSocket messages dropped for exceeding a per-connection rate limit (see rateLimiter.ts), by message category",
+  labelNames: ["kind"],
+  registers: [register],
+});

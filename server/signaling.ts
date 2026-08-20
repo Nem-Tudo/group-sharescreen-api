@@ -36,6 +36,15 @@ import {
   findBannedWord,
 } from "./moderationStore.js";
 import { MONGO_ENABLED, isMongoConnected } from "./mongo.js";
+import {
+  wsGlobalLimiter,
+  wsRegisterLimiter,
+  wsJoinLimiter,
+  wsChatLimiter,
+  wsSignalLimiter,
+  wsToggleLimiter,
+  consumeRateLimit,
+} from "./rateLimiter.js";
 
 const HANDLE_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 const CLIENT_ID_RE = /^[a-zA-Z0-9-]{8,64}$/;
@@ -123,6 +132,15 @@ interface ClientInfo {
   // someone else's session.
   guestId?: string;
   guestVerified?: boolean;
+  // Stable per-connection key for the message-rate limiters in
+  // rateLimiter.ts — set once at connect time and never touched again.
+  // Deliberately *not* the same as `id`: `id` can be reassigned mid-life
+  // when this connection reclaims a previous session's clientId (see
+  // "register" below), and a rate-limit bucket should stay tied to this one
+  // physical socket regardless of what identity it's currently wearing —
+  // otherwise reclaiming an id would also silently inherit (or hand off)
+  // whatever budget that id's bucket happened to have left.
+  rateLimitKey: string;
 }
 
 interface RoomInfo {
@@ -518,7 +536,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // rooms — but only ever returns a single aggregate number, never handles
   // or peer detail, so it can't be used to discover a private room's
   // existence the way /admin/rooms can.
-  app.get("/stats", async () => {
+  //
+  // Public and cheap, and realistically polled by every open tab's UI
+  // (people-online widget) — generous limit, well above what one real
+  // visitor's polling loop needs, tuned against a scripted hammering loop
+  // instead.
+  app.get("/stats", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
     let peopleOnline = 0;
     for (const info of rooms.values()) peopleOnline += realPeopleCount(info);
     return { peopleOnline };
@@ -527,7 +550,10 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // Public room directory. Private rooms (handle starts with "priv-") are
   // filtered out here, server-side — the client never receives them, so
   // there's no separate access-control step to forget on the frontend.
-  app.get("/rooms", async () => {
+  //
+  // Same reasoning/limit as /stats: public, cheap, polled by the room
+  // browser UI on a normal cadence.
+  app.get("/rooms", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
     const publicRooms = [...rooms.entries()]
       .filter(([handle]) => !isPrivateRoom(handle))
       .map(([handle, info]) => ({
@@ -544,7 +570,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // adminAuth.ts) — it's just an account whose flags include "ADMIN" (see
   // accountStore.ts's initAccountStore bootstrap), checked identically to
   // every other route below via requireAdmin.
-  app.post("/auth/register", async (request, reply) => {
+  // Account creation — cheap to abuse into a spam/enumeration tool if left
+  // uncapped (each attempt tries a password hash + a uniqueness check), and
+  // nobody legitimately creates more than a couple of accounts per IP in a
+  // sitting, so this stays tight.
+  app.post(
+    "/auth/register",
+    { config: { rateLimit: { max: 5, timeWindow: "15 minutes" } } },
+    async (request, reply) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
     const username = (typeof body.username === "string" ? body.username.trim() : "").toLowerCase();
     const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
@@ -568,7 +601,10 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     }
   });
 
-  app.post("/auth/login", async (request, reply) => {
+  // Login is the classic brute-force target — capped tighter than most
+  // routes here, but loose enough that someone fat-fingering their own
+  // password a few times in a row doesn't get locked out mid-attempt.
+  app.post("/auth/login", { config: { rateLimit: { max: 10, timeWindow: "5 minutes" } } }, async (request, reply) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
     const username = typeof body.username === "string" ? body.username.trim() : "";
     const password = typeof body.password === "string" ? body.password : "";
@@ -580,7 +616,9 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return { token, account };
   });
 
-  app.get("/auth/me", async (request, reply) => {
+  // Just a token verify + in-memory lookup, and realistically called on
+  // every page load/focus to confirm the session — generous like /stats.
+  app.get("/auth/me", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     const payload = verifyToken(request.headers.authorization?.startsWith("Bearer ")
       ? request.headers.authorization.slice(7)
       : null);
@@ -593,7 +631,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // Full room directory for moderators — unlike /rooms, this includes
   // private rooms and per-peer detail, since moderation is the one
   // legitimate reason to need that visibility.
-  app.get("/admin/rooms", async (request, reply) => {
+  // Every /admin/* route below is already gated by requireAdmin, so its
+  // realistic caller set is just the admin panel itself (a handful of
+  // moderators at most) — limits here exist as a backstop against a buggy
+  // polling loop or a leaked token, not against a wide pool of untrusted
+  // callers, so GETs get a generous per-minute budget...
+  app.get("/admin/rooms", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -616,14 +659,21 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // not scoped to a room. GET lets the admin panel show whether one's
   // already active on load; POST replaces it (and re-broadcasts); DELETE
   // ends it for everyone currently connected.
-  app.get("/admin/announcement", async (request, reply) => {
-    if (!requireAdmin(request)) {
-      return reply.code(401).send({ error: "unauthorized" });
+  app.get(
+    "/admin/announcement",
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      return { announcement: currentAnnouncement };
     }
-    return { announcement: currentAnnouncement };
-  });
+  );
 
-  app.post("/admin/announcement", async (request, reply) => {
+  // ...while mutating admin actions (POST/PUT/DELETE) get a tighter one —
+  // still far above what a human clicking a button ever needs, just enough
+  // to blunt a runaway script.
+  app.post("/admin/announcement", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -669,7 +719,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return { announcement: currentAnnouncement };
   });
 
-  app.delete("/admin/announcement", async (request, reply) => {
+  app.delete("/admin/announcement", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -680,7 +730,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
 
   // Dashboard overview for the admin panel — aggregate numbers only (no
   // room/peer detail, see /admin/rooms for that), so it's cheap to poll.
-  app.get("/admin/stats", async (request, reply) => {
+  app.get("/admin/stats", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -710,14 +760,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // currently connected from that IP is disconnected right away (see
   // disconnectClientsByIp), and every future "/ws" upgrade from it is
   // rejected before it's ever added to `clients` — see the handler below.
-  app.get("/admin/bans", async (request, reply) => {
+  app.get("/admin/bans", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     return { bans: listBans() };
   });
 
-  app.post("/admin/bans", async (request, reply) => {
+  app.post("/admin/bans", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -736,7 +786,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return { ban };
   });
 
-  app.delete("/admin/bans/:ip", async (request, reply) => {
+  app.delete("/admin/bans/:ip", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -748,14 +798,18 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // Chat content filter — one flat list of forbidden words/phrases, replaced
   // wholesale on every PUT (see setBannedWords) rather than incremental
   // add/remove endpoints, matching the shape of a single admin textarea.
-  app.get("/admin/banned-words", async (request, reply) => {
-    if (!requireAdmin(request)) {
-      return reply.code(401).send({ error: "unauthorized" });
+  app.get(
+    "/admin/banned-words",
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      return { words: listBannedWords() };
     }
-    return { words: listBannedWords() };
-  });
+  );
 
-  app.put("/admin/banned-words", async (request, reply) => {
+  app.put("/admin/banned-words", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -767,7 +821,19 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return { words };
   });
 
-  app.get("/ws", { websocket: true }, (socket: WebSocket, request: FastifyRequest) => {
+  app.get(
+    "/ws",
+    {
+      websocket: true,
+      // Bounds *connection attempts* per IP, not concurrent connections or
+      // anything that happens over an already-open socket (that's the
+      // per-message limiters in rateLimiter.ts, applied inside the message
+      // handler below). 30/min comfortably covers a real client's
+      // reconnect/backoff behavior (network blips, sleep/wake, page
+      // reloads) while still bounding a connection-flood attempt.
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    },
+    (socket: WebSocket, request: FastifyRequest) => {
     const ip = request.ip;
     if (isIpBanned(ip)) {
       bannedIpConnectionsRejectedTotal.inc();
@@ -784,6 +850,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       isAlive: true,
       socket,
       ip,
+      rateLimitKey: genId(),
     };
     clients.set(socket, info);
     wsConnectionsTotal.inc();
@@ -805,8 +872,22 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       }
       if (!msg || typeof msg.type !== "string") return;
 
+      // Backstop across every message type combined for this connection —
+      // runs before the per-type limiters below so it also catches a flood
+      // of a `type` no case here recognizes (which the `default: break`
+      // would otherwise process at unlimited rate).
+      if (!(await consumeRateLimit(wsGlobalLimiter, info.rateLimitKey, "global"))) return;
+
       switch (msg.type) {
         case "register": {
+          // Covers both the initial registration and every later rename
+          // (renaming doesn't re-enter via "join" — see below), so one
+          // budget for both is enough to stop a rename-spam loop without
+          // getting in the way of a real, occasional name change.
+          if (!(await consumeRateLimit(wsRegisterLimiter, info.rateLimitKey, "register"))) {
+            send(socket, { type: "register-error", message: "Muitas tentativas. Aguarde um instante." });
+            return;
+          }
           // A logged-in client passes its account JWT here; a guest passes
           // whatever guest token a previous "registered" response handed it
           // (see below) — same `token` field either way, told apart by the
@@ -971,6 +1052,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           break;
         }
         case "join": {
+          // Shared with "admin-join" below — switching rooms is something a
+          // real connection does rarely, never in a tight loop.
+          if (!(await consumeRateLimit(wsJoinLimiter, info.rateLimitKey, "join"))) {
+            send(socket, { type: "join-error", message: "Muitas tentativas. Aguarde um instante." });
+            return;
+          }
           if (!info.name) {
             send(socket, { type: "error", message: "Registre um nome antes de entrar em uma sala." });
             return;
@@ -1052,6 +1139,10 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         // plain "leave" message (and socket close already calls
         // leaveRoom() regardless), so no separate cleanup path is needed.
         case "admin-join": {
+          if (!(await consumeRateLimit(wsJoinLimiter, info.rateLimitKey, "join"))) {
+            send(socket, { type: "error", message: "Muitas tentativas. Aguarde um instante." });
+            return;
+          }
           const token = typeof msg.token === "string" ? msg.token : "";
           const adminPayload = verifyToken(token);
           if (!adminPayload || !adminPayload.flags.includes("ADMIN")) {
@@ -1099,18 +1190,35 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         }
         case "sharing": {
           if (!info.room) return;
+          // Dropped silently (no client feedback) when over budget: this is
+          // transient toggle state, not a one-shot user action — the next
+          // real toggle just propagates normally once the window resets.
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
           info.sharing = Boolean(msg.sharing);
           broadcastToRoom(info.room, { type: "peer-sharing", id: info.id, sharing: info.sharing });
           break;
         }
         case "mic": {
           if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
           info.mic = Boolean(msg.mic);
           broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
           break;
         }
         case "chat": {
           if (!info.room) return;
+          // Only rate-limited case besides "register"/"join" that gives the
+          // client explicit feedback — chat is a deliberate, one-off user
+          // action, so silently eating a message (like "signal" below does)
+          // would look like a bug rather than a rate limit; reusing
+          // "chat-blocked" means the frontend already has UI for this.
+          if (!(await consumeRateLimit(wsChatLimiter, info.rateLimitKey, "chat"))) {
+            send(socket, {
+              type: "chat-blocked",
+              message: "Você está enviando mensagens rápido demais. Aguarde um instante.",
+            });
+            return;
+          }
           const isGif = msg.kind === "gif";
           let chatMessage: ChatMessage;
           if (isGif) {
@@ -1156,6 +1264,13 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         }
         case "signal": {
           if (!info.room) return;
+          // Dropped silently, not surfaced to the client: this limiter is
+          // sized well above what a real mesh negotiation ever needs (see
+          // wsSignalLimiter in rateLimiter.ts), so hitting it means
+          // something is already wrong — no UI message would help, and
+          // WebRTC's own negotiation/retry logic tolerates an occasional
+          // missed signal better than a user-facing error would.
+          if (!(await consumeRateLimit(wsSignalLimiter, info.rateLimitKey, "signal"))) return;
           const targetId = typeof msg.to === "string" ? msg.to : "";
           if (!targetId) return;
           const dataKind =

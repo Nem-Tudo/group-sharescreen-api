@@ -15,8 +15,9 @@ import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import websocketPlugin from "@fastify/websocket";
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import { registerSignalingRoutes } from "./signaling.js";
-import { register as metricsRegister } from "./metrics.js";
+import { register as metricsRegister, httpRateLimitedTotal } from "./metrics.js";
 import { initModerationStore } from "./moderationStore.js";
 import { initAccountStore } from "./accountStore.js";
 
@@ -66,19 +67,50 @@ async function main() {
     options: { maxPayload: 64 * 1024 },
   });
 
-  app.get("/health", async () => ({ ok: true, CURRENT_ID }));
-
-  app.get("/metrics", async (request, reply) => {
-    if (METRICS_TOKEN) {
-      const header = request.headers.authorization || "";
-      const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
-      if (provided !== METRICS_TOKEN) {
-        return reply.code(401).send("Unauthorized");
-      }
-    }
-    reply.header("Content-Type", metricsRegister.contentType);
-    return metricsRegister.metrics();
+  // Global default: applies to every route below unless overridden via that
+  // route's own `config.rateLimit` (see signaling.ts, and the /health and
+  // /metrics overrides right here) — most routes never touch this default
+  // at all, it's just the floor for anything nobody's specifically tuned.
+  // `global: true` (the plugin default) is what makes it apply automatically
+  // to routes registered later, including the ones inside the nested
+  // `registerSignalingRoutes` context below — a root-level onRequest hook
+  // reaches every child context in Fastify's encapsulation model.
+  await app.register(rateLimit, {
+    max: 100,
+    timeWindow: "1 minute",
+    onExceeded: (request) => {
+      httpRateLimitedTotal.inc({ route: request.routeOptions?.url ?? request.url });
+    },
   });
+
+  // Health checks (uptime monitors, container orchestrator probes, load
+  // balancers) can legitimately poll every few seconds from a fixed set of
+  // IPs — rate limiting this would risk the check itself flapping the
+  // service as unhealthy, which is worse than any abuse this endpoint could
+  // realistically absorb (it does nothing but echo a constant).
+  app.get("/health", { config: { rateLimit: false } }, async () => ({ ok: true, CURRENT_ID }));
+
+  app.get(
+    "/metrics",
+    {
+      // Scraped automatically (Prometheus et al.) on a fixed interval from a
+      // small, known set of scrapers — generous enough to tolerate several
+      // scrape configs hitting it in parallel, but still capped in case this
+      // ever ends up reachable without METRICS_TOKEN set.
+      config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+    },
+    async (request, reply) => {
+      if (METRICS_TOKEN) {
+        const header = request.headers.authorization || "";
+        const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
+        if (provided !== METRICS_TOKEN) {
+          return reply.code(401).send("Unauthorized");
+        }
+      }
+      reply.header("Content-Type", metricsRegister.contentType);
+      return metricsRegister.metrics();
+    }
+  );
 
   await app.register(async (instance) => {
     registerSignalingRoutes(instance, randomUUID);
