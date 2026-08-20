@@ -1,11 +1,20 @@
 // Cloudflare Turnstile server-side verification — gates the WS "join"
 // message (see signaling.ts), since that's also how a room gets *created*
 // in this codebase (the first join creates it — there's no separate
-// "create room" action). Opt-in via TURNSTILE_SECRET_KEY: unset (local dev,
-// or before the front-end wires up the widget) and this no-ops everything
-// through, same pattern as MONGO_ENABLED/METRICS_TOKEN elsewhere here.
+// "create room" action). Two separate opt-ins, deliberately not one:
+//   - TURNSTILE_SECRET_KEY: needed at all to call Cloudflare's siteverify.
+//     Unset (local dev, or before the front-end widget exists) and
+//     verifyTurnstileToken below just passes everyone through, same
+//     pattern as MONGO_ENABLED/METRICS_TOKEN elsewhere in this server.
+//   - TURNSTILE_ENABLED=true: actually *enforces* it (see TURNSTILE_ENABLED
+//     below and its use in signaling.ts's "join" handler) — kept separate
+//     from the secret key so the key + front-end widget can be deployed and
+//     exercised first without immediately rejecting anyone. Older,
+//     not-yet-updated clients never send a token at all, so flipping
+//     enforcement on the moment the key is configured would lock all of
+//     them out; this way it only turns on once someone deliberately does so.
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || null;
-export const TURNSTILE_ENABLED = TURNSTILE_SECRET_KEY !== null;
+export const TURNSTILE_ENABLED = process.env.TURNSTILE_ENABLED === "true" && TURNSTILE_SECRET_KEY !== null;
 
 const SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 // Cloudflare's own guidance: treat a slow/unreachable siteverify call as a
