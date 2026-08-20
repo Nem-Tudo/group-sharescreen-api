@@ -6,6 +6,13 @@ export interface ChatMessage {
   id: string;
   from: string;
   name: string;
+  // Whether the sender was logged into a registered account at send time
+  // (see signaling.ts's ClientInfo.accountId) — captured per-message,
+  // same as `name`, rather than looked up live, so history stays accurate
+  // even if that person's account status changes later. Absent on messages
+  // persisted before this field existed; clients treat that the same as
+  // `false` (not a guest) since it's the safer default for old data.
+  isGuest?: boolean;
   kind?: "text" | "gif";
   text: string;
   url?: string;

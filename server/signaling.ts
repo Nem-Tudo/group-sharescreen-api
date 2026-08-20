@@ -704,6 +704,9 @@ function peerSummary(info: ClientInfo) {
     name: info.name,
     sharing: info.sharing,
     mic: info.mic,
+    // Not logged into a registered account — the client renders this as a
+    // "(guest)" suffix wherever the name is shown (see lib/displayName.ts).
+    isGuest: !info.accountId,
     ...(info.isModerator ? { role: "moderator" as const } : {}),
   };
 }
@@ -993,7 +996,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
         peers: [...info.sockets]
           .map((s) => clients.get(s))
           .filter((c): c is ClientInfo => c !== undefined && !c.isModerator)
-          .map((c) => ({ id: c.id, name: c.name, sharing: c.sharing, mic: c.mic, ip: c.ip })),
+          .map((c) => ({ id: c.id, name: c.name, sharing: c.sharing, mic: c.mic, ip: c.ip, isGuest: !c.accountId })),
       }))
       .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
     return { rooms: allRooms };
@@ -1588,7 +1591,11 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             .map(peerSummary);
           send(socket, { type: "room-state", room, selfId: info.id, peers, messages: roomInfo.messages });
           flushPendingSignals(info);
-          broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name }, socket);
+          broadcastToRoom(
+            room,
+            { type: "peer-joined", id: info.id, name: info.name, isGuest: !info.accountId },
+            socket
+          );
           break;
         }
         // A moderator entering a room to watch/listen for moderation.
@@ -1643,7 +1650,11 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             messages: roomInfo.messages,
           });
           flushPendingSignals(info);
-          broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name, role: "moderator" }, socket);
+          broadcastToRoom(
+            room,
+            { type: "peer-joined", id: info.id, name: info.name, isGuest: !info.accountId, role: "moderator" },
+            socket
+          );
           break;
         }
         case "leave": {
@@ -1690,6 +1701,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               id: genId(),
               from: info.id,
               name: info.name as string,
+              isGuest: !info.accountId,
               kind: "gif",
               text: "",
               url,
@@ -1710,6 +1722,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               id: genId(),
               from: info.id,
               name: info.name as string,
+              isGuest: !info.accountId,
               text,
               ts: Date.now(),
             };
