@@ -16,10 +16,11 @@ import Fastify from "fastify";
 import websocketPlugin from "@fastify/websocket";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
-import { registerSignalingRoutes } from "./signaling.js";
+import { registerSignalingRoutes, initClusterAnnouncementSync } from "./signaling.js";
 import { register as metricsRegister, httpRateLimitedTotal } from "./metrics.js";
 import { initModerationStore } from "./moderationStore.js";
 import { initAccountStore } from "./accountStore.js";
+import { connectCluster } from "./cluster.js";
 
 const PORT = Number(process.env.PORT || 4000);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -33,12 +34,32 @@ const METRICS_TOKEN = process.env.METRICS_TOKEN || null;
 const CURRENT_ID = randomUUID()
 
 async function main() {
+  // Every piece of realtime signaling state (rooms, presence, name
+  // reservations, clientId ownership/reclaim, the WebRTC signal relay, the
+  // announcement banner — see cluster.ts) is coordinated through Redis, so
+  // it stays consistent across however many instances of this process run
+  // behind a load balancer. That coordination is what makes running more
+  // than one instance safe at all, so REDIS_URL is required, not optional —
+  // fail fast here rather than let a Redis-less second instance silently
+  // desync from the first one.
+  if (!process.env.REDIS_URL) {
+    console.error("[server] REDIS_URL não configurada — obrigatória (ver server/cluster.ts).");
+    process.exit(1);
+  }
+
   // trustProxy: this always runs behind a reverse proxy in production (see
   // README — apigolive.nemtudo.me), so request.ip needs to read the real
   // client address from X-Forwarded-For instead of the proxy's own address.
   // Without it every connection would appear to come from the same IP,
   // making IP bans useless.
   const app = Fastify({ logger: true, trustProxy: true });
+
+  // Connects the Redis command/subscriber clients used for cross-instance
+  // coordination (cluster.ts) before anything else touches them, and primes
+  // this instance's local announcement banner from whatever's currently
+  // persisted (see initClusterAnnouncementSync in signaling.ts).
+  await connectCluster();
+  await initClusterAnnouncementSync();
 
   // Loads persisted IP bans and banned words (Mongo if MONGO_URL is set,
   // otherwise a local JSON file — see moderationStore.ts) before the server

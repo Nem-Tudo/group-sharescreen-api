@@ -128,6 +128,35 @@ export async function savePersistedChat(room: string, messages: ChatMessage[]): 
   }
 }
 
+// Appends one message and trims to `limit` atomically (single round trip,
+// via multi()) instead of rewriting the whole list like savePersistedChat
+// does. That full-overwrite rewrite is safe for a single process (it's
+// always rewriting from that process's own authoritative in-memory copy),
+// but not once multiple signaling instances can each append to the same
+// room's history at nearly the same time — two overwrites racing would let
+// one clobber the message the other just wrote. rPush+lTrim never
+// overwrites another instance's write, so this is the one used by
+// signaling.ts's "chat" handler; savePersistedChat stays as-is for its
+// existing callers.
+export async function appendPersistedChat(room: string, message: ChatMessage, limit: number): Promise<void> {
+  if (!REDIS_URL) {
+    const messages = loadFromDisk(room);
+    messages.push(message);
+    if (messages.length > limit) messages.splice(0, messages.length - limit);
+    saveToDisk(room, messages);
+    return;
+  }
+  try {
+    const client = await getRedis();
+    const key = redisKey(room);
+    const multi = client.multi().rPush(key, JSON.stringify(message));
+    multi.lTrim(key, -limit, -1);
+    await multi.exec();
+  } catch (err) {
+    console.error("[chatStore] Erro ao anexar mensagem no Redis:", (err as Error).message);
+  }
+}
+
 export async function deletePersistedChat(room: string): Promise<void> {
   if (!REDIS_URL) return deleteFromDisk(room);
   try {

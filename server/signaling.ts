@@ -21,7 +21,7 @@ import {
 } from "./accountStore.js";
 import {
   loadPersistedChat,
-  savePersistedChat,
+  appendPersistedChat,
   deletePersistedChat,
   type ChatMessage,
 } from "./chatStore.js";
@@ -45,6 +45,36 @@ import {
   wsToggleLimiter,
   consumeRateLimit,
 } from "./rateLimiter.js";
+import {
+  instanceId as clusterInstanceId,
+  getRoomPeers,
+  roomCounts,
+  listAllRooms,
+  upsertRoomPeer,
+  removeRoomPeer,
+  reserveRoomName,
+  releaseRoomName,
+  getRoomNameHolder,
+  getClientRecord,
+  setClientRecord,
+  deleteClientRecordIfOwn,
+  subscribeRoomChannel,
+  unsubscribeRoomChannel,
+  publishRoomEvent,
+  subscribeAnnouncementChannel,
+  publishAnnouncement,
+  getStoredAnnouncement,
+  subscribeClientChannel,
+  unsubscribeClientChannel,
+  publishToClient,
+  queuePendingSignal,
+  flushPendingSignals as flushClusterPendingSignals,
+  touchRoomPeerHeartbeat,
+  touchClientHeartbeat,
+  clearRoomCreatedAt,
+  type RoomPeerRecord,
+  type ClientChannelMessage,
+} from "./cluster.js";
 
 const HANDLE_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 const CLIENT_ID_RE = /^[a-zA-Z0-9-]{8,64}$/;
@@ -141,17 +171,28 @@ interface ClientInfo {
   // otherwise reclaiming an id would also silently inherit (or hand off)
   // whatever budget that id's bucket happened to have left.
   rateLimitKey: string;
+  // The epoch this connection last wrote into cluster.ts's global clientId
+  // registry (see setClientRecord) — the cross-process equivalent of
+  // checking `clientsById.get(info.id) === info`. deleteClientRecordIfOwn
+  // uses it to guard against a delayed/stale cleanup deleting a newer
+  // owner's fresh registry entry (see "register" and detachSession).
+  registryEpoch?: string;
+  // The clientId this connection is currently subscribed to on cluster.ts's
+  // per-client Redis channel (see subscribeClientChannel) — lets "register"
+  // detect when `info.id` changed and needs to move its subscription.
+  clientChannelId?: string;
 }
 
+// Local, per-instance cache: which of this room's sockets/chat history live
+// on *this* process. Room membership, name reservations, and clientId
+// ownership are no longer decided from this — cluster.ts's Redis-backed
+// roster is now the single cross-instance source of truth for those, so
+// there's exactly one place that can ever disagree with itself. This local
+// cache exists purely so same-instance delivery (broadcastToRoom) and the
+// room-state chat snapshot stay a zero-Redis-hop fast path.
 interface RoomInfo {
   sockets: Set<WebSocket>;
-  createdAt: number;
   messages: ChatMessage[];
-  // Room-scoped display-name reservations — separate from any other room,
-  // so the same name can be used freely in two different rooms at once (see
-  // isSameOwner and the "join"/"register" handlers). Keyed the same way the
-  // old global `namesInUse` map used to be (lowercased name -> holder).
-  names: Map<string, WebSocket>;
 }
 
 // Whether `challenger` may take over `existing`'s session/room slot — used
@@ -168,7 +209,18 @@ interface RoomInfo {
 // never count is an *unverified* guestId on the challenger's side, freshly
 // made up for this connection: unlike a verified one, that proves nothing
 // about who's on the other end.
-function isSameOwner(existing: ClientInfo, challenger: ClientInfo): boolean {
+// Structural shape shared by ClientInfo (a live local connection) and
+// cluster.ts's ClientRecord (the plain JSON read back from the Redis
+// clientId registry for a session that lives on a *different* instance) —
+// one ownership rule, reused for both the local and cross-instance reclaim
+// paths (see resolveOwnerIdentity below) instead of duplicating it.
+interface OwnerIdentity {
+  accountId?: string;
+  guestId?: string;
+  guestVerified?: boolean;
+}
+
+function isSameOwner(existing: OwnerIdentity, challenger: OwnerIdentity): boolean {
   if (existing.accountId || challenger.accountId) {
     return Boolean(challenger.accountId) && existing.accountId === challenger.accountId;
   }
@@ -210,7 +262,11 @@ const ROOM_DELETION_GRACE_MS = 20_000;
 // pushes it to every open socket regardless of what room (if any) they're
 // in, and a fresh connection gets whatever's currently active appended
 // right after "welcome" so it isn't missed by someone who (re)connects
-// while it's up.
+// while it's up. Every instance keeps its own copy of this in sync via
+// cluster.ts's announcement channel (see initClusterSync below) — primed
+// once at startup from Redis, then updated in lockstep by every
+// instance's subscription handler whenever any instance's admin route
+// changes it.
 let currentAnnouncement: Announcement | null = null;
 
 // A WebRTC offer/answer/ICE candidate is only useful for a few seconds, but
@@ -219,15 +275,9 @@ let currentAnnouncement: Announcement | null = null;
 // handoff, a brief signal drop triggering a reconnect). A dropped offer is
 // never resent by anything else, so it permanently stranded that one
 // viewer's connection (peer shows in the room, but no video ever arrives).
-// Queuing briefly and flushing once the target (re)joins closes that gap.
-interface PendingSignal {
-  from: string;
-  data: unknown;
-  queuedAt: number;
-}
+// Queuing briefly (in Redis — see cluster.ts's queuePendingSignal) and
+// flushing once the target (re)joins, on *any* instance, closes that gap.
 const PENDING_SIGNAL_TTL_MS = 15_000;
-const MAX_PENDING_SIGNALS_PER_TARGET = 32;
-const pendingSignals = new Map<string, PendingSignal[]>();
 
 registerStatsProvider(() => {
   const registeredPeers = [...clients.values()].filter((c) => c.name !== null && !c.isModerator);
@@ -331,20 +381,17 @@ function broadcastToAll(msg: unknown) {
   for (const s of clients.keys()) send(s, msg);
 }
 
-function queueSignal(targetId: string, from: string, data: unknown) {
-  const queue = pendingSignals.get(targetId) ?? [];
-  queue.push({ from, data, queuedAt: Date.now() });
-  while (queue.length > MAX_PENDING_SIGNALS_PER_TARGET) queue.shift();
-  pendingSignals.set(targetId, queue);
-}
-
 // Delivers a relayed signal immediately if the target is reachable in the
-// same room right now; otherwise queues it for flushPendingSignals to
-// deliver once that peer (re)joins. Deliberately keyed by client id (not
-// looked up via clientsById), since a silently-watching moderator socket
-// (see "admin-join") never registers a name and so never gets a clientsById
+// same room, on *this* instance, right now (zero Redis cost — the common
+// case). Otherwise publishes it straight to whichever instance currently
+// holds that clientId's per-client channel (see cluster.ts); if nobody's
+// subscribed anywhere right now (publish reports 0 subscribers), queues it
+// in Redis for flushPendingSignalsFor to deliver once that peer (re)joins,
+// on any instance. Deliberately keyed by client id (not looked up via
+// clientsById), since a silently-watching moderator socket (see
+// "admin-join") never registers a name and so never gets a clientsById
 // entry at all.
-function deliverOrQueueSignal(room: string, targetId: string, from: string, data: unknown) {
+async function deliverOrQueueSignal(room: string, targetId: string, from: string, data: unknown) {
   const roomInfo = rooms.get(room);
   const target = roomInfo
     ? [...roomInfo.sockets].map((s) => clients.get(s)).find((c) => c?.id === targetId)
@@ -353,13 +400,14 @@ function deliverOrQueueSignal(room: string, targetId: string, from: string, data
     send(target.socket, { type: "signal", from, data });
     return;
   }
-  queueSignal(targetId, from, data);
+  const delivered = await publishToClient(targetId, { type: "signal", from, data });
+  if (delivered === 0) {
+    await queuePendingSignal(targetId, { from, data, queuedAt: Date.now() });
+  }
 }
 
-function flushPendingSignals(info: ClientInfo) {
-  const queue = pendingSignals.get(info.id);
-  if (!queue) return;
-  pendingSignals.delete(info.id);
+async function flushPendingSignalsFor(info: ClientInfo) {
+  const queue = await flushClusterPendingSignals(info.id);
   const now = Date.now();
   for (const item of queue) {
     if (now - item.queuedAt > PENDING_SIGNAL_TTL_MS) continue;
@@ -367,13 +415,28 @@ function flushPendingSignals(info: ClientInfo) {
   }
 }
 
-function peerSummary(info: ClientInfo) {
+// The identity a peer's *local preferences* (e.g. a client remembering a
+// per-peer volume) should be keyed on — stable across reconnects/reloads
+// for the same account or guest, unlike `info.id`/`peer.id` which is
+// per-connection and gets reissued every time. Guest-side this is the same
+// value regardless of `guestVerified`: verification only affects ownership
+// claims (see isSameOwner), not the id itself.
+function stableUserId(info: ClientInfo): string | undefined {
+  return info.accountId ?? info.guestId;
+}
+
+// Wire shape sent to clients for each peer in a room — mirrors the old
+// local peerSummary()'s output, now sourced from cluster.ts's Redis roster
+// (RoomPeerRecord) instead of a local ClientInfo, since peers can live on
+// any instance.
+function toWirePeer(peer: RoomPeerRecord) {
   return {
-    id: info.id,
-    name: info.name,
-    sharing: info.sharing,
-    mic: info.mic,
-    ...(info.isModerator ? { role: "moderator" as const } : {}),
+    id: peer.id,
+    name: peer.name,
+    sharing: peer.sharing,
+    mic: peer.mic,
+    userId: peer.userId,
+    ...(peer.isModerator ? { role: "moderator" as const } : {}),
   };
 }
 
@@ -411,44 +474,60 @@ function clearRoomDeletionTimer(room: string) {
   }
 }
 
-// Tears the room down — both in memory and its persisted chat file — only
-// if it's still empty once ROOM_DELETION_GRACE_MS has elapsed, giving a
+// Tears the room down — both this instance's local cache and, if nobody's
+// left in it on *any* instance, its persisted chat file — only if it's
+// still empty once ROOM_DELETION_GRACE_MS has elapsed, giving a
 // reload/brief drop time to reconnect and reclaim it first.
 function scheduleRoomDeletion(room: string) {
   clearRoomDeletionTimer(room);
   const timer = setTimeout(() => {
     roomDeletionTimers.delete(room);
-    const roomInfo = rooms.get(room);
-    if (roomInfo && roomInfo.sockets.size === 0) {
-      rooms.delete(room);
-      deletePersistedChat(room);
-    }
+    void finalizeRoomDeletion(room);
   }, ROOM_DELETION_GRACE_MS);
   roomDeletionTimers.set(room, timer);
 }
 
-function leaveRoom(info: ClientInfo) {
+async function finalizeRoomDeletion(room: string) {
+  const roomInfo = rooms.get(room);
+  // Someone rejoined locally while the grace period was running — leave
+  // everything alone, same as the original synchronous check.
+  if (!roomInfo || roomInfo.sockets.size !== 0) return;
+  rooms.delete(room);
+  await unsubscribeRoomChannel(room);
+  // This instance is done with the room, but another instance could still
+  // have peers in it — only wipe the shared chat history once the Redis
+  // roster confirms nobody's left anywhere. Safe to run on every instance
+  // whose timer fires while empty: deletePersistedChat is an idempotent
+  // delete, so two instances racing here can't corrupt anything.
+  const peers = await getRoomPeers(room);
+  if (peers.length === 0) {
+    deletePersistedChat(room);
+    void clearRoomCreatedAt(room);
+  }
+}
+
+async function leaveRoom(info: ClientInfo) {
   if (!info.room) return;
   const room = info.room;
   const roomInfo = rooms.get(room);
   if (roomInfo) {
     roomInfo.sockets.delete(info.socket);
-    if (info.name && roomInfo.names.get(info.name.toLowerCase()) === info.socket) {
-      roomInfo.names.delete(info.name.toLowerCase());
-    }
     if (roomInfo.sockets.size === 0) {
-      // The room *looks* empty, but don't wipe its chat history yet — see
-      // scheduleRoomDeletion. (A same-identity reconnect that briefly
-      // overlaps the old socket goes through detachSession instead, which
-      // deliberately does NOT delete the file either, since that's not a
-      // real departure — see detachSession's comment.)
+      // The room *looks* empty on this instance, but don't wipe its shared
+      // chat history yet — see scheduleRoomDeletion/finalizeRoomDeletion.
+      // (A same-identity reconnect that briefly overlaps the old socket
+      // goes through detachSession instead, which deliberately does NOT
+      // delete the room's chat history either, since that's not a real
+      // departure — see detachSession's comment.)
       scheduleRoomDeletion(room);
     }
   }
+  if (info.name) await releaseRoomName(room, info.name.toLowerCase(), info.id);
+  await removeRoomPeer(room, info.id);
   info.room = null;
   info.sharing = false;
   info.mic = false;
-  broadcastToRoom(room, { type: "peer-left", id: info.id }, info.socket);
+  await broadcastToRoomCluster(room, { type: "peer-left", id: info.id }, info.socket);
 }
 
 // Close code used when a second connection reclaims a client id out from
@@ -462,27 +541,53 @@ function leaveRoom(info: ClientInfo) {
 const SUPERSEDED_CLOSE_CODE = 4000;
 
 // Used when a reconnect (same persisted client id) shows up before the old
-// socket has been reaped yet — e.g. a brief network blip, or a second tab.
-// Removes the stale session from every bookkeeping structure and closes it
-// *without* broadcasting peer-left, since this identity is carried over
-// seamlessly to the new socket rather than actually leaving the room.
-function detachSession(info: ClientInfo) {
+// socket has been reaped yet — e.g. a brief network blip, or a second tab —
+// and also as the reclaim handler run on whichever instance actually holds
+// `info` when a *different* instance's connection reclaims it (see
+// handleClientChannelMessage below: a "reclaim" message just calls this
+// directly). Removes the stale session from every bookkeeping structure
+// (local and Redis) and closes it *without* broadcasting peer-left, since
+// this identity is carried over seamlessly to the new connection rather
+// than actually leaving the room.
+//
+// In the cross-instance case there's a narrow, self-healing race: the
+// challenger's own writes (reserveRoomName/upsertRoomPeer, or a fresh
+// clientId registry epoch) aren't ordered relative to this cleanup running
+// on a different process. deleteClientRecordIfOwn's epoch guard makes the
+// registry cleanup race-free either way; a plain name/peerId collision
+// between the two is impossible (the challenger never reclaims its *own*
+// id's room slot this way — see "join"'s isSameOwner check, which only
+// takes this path for a *different* peerId than the challenger's own). The
+// one case left is genuinely rare (two instances racing to reclaim the
+// exact same identity within milliseconds of each other) and self-corrects
+// on that peer's next rename/toggle/rejoin — the same order of accepted
+// race this codebase already lives with elsewhere (see the "join" handler's
+// loadPersistedChat comment).
+async function detachSession(info: ClientInfo) {
   if (info.room) {
-    const roomInfo = rooms.get(info.room);
+    const room = info.room;
+    const roomInfo = rooms.get(room);
     if (roomInfo) {
       roomInfo.sockets.delete(info.socket);
-      if (info.name && roomInfo.names.get(info.name.toLowerCase()) === info.socket) {
-        roomInfo.names.delete(info.name.toLowerCase());
-      }
       // Deliberately leaves the persisted chat file alone even if this was
-      // the room's last socket: the new connection taking over this
+      // the room's last local socket: the new connection taking over this
       // identity is about to "join" the same room again, and will reload
-      // this exact history from disk when it recreates the RoomInfo.
-      if (roomInfo.sockets.size === 0) rooms.delete(info.room);
+      // this exact history when it recreates the local RoomInfo.
+      if (roomInfo.sockets.size === 0) {
+        rooms.delete(room);
+        await unsubscribeRoomChannel(room);
+      }
     }
+    if (info.name) await releaseRoomName(room, info.name.toLowerCase(), info.id);
+    await removeRoomPeer(room, info.id);
     info.room = null;
   }
   if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+  await deleteClientRecordIfOwn(info.id, info.registryEpoch);
+  if (info.clientChannelId) {
+    await unsubscribeClientChannel(info.clientChannelId);
+    info.clientChannelId = undefined;
+  }
   clients.delete(info.socket);
   // A graceful close (not terminate()) so the close frame with our code
   // actually reaches the displaced client instead of the connection just
@@ -492,13 +597,134 @@ function detachSession(info: ClientInfo) {
 
 // Terminates every socket currently connected from `ip` — called right
 // after an admin bans it, so the ban takes effect immediately instead of
-// only blocking that IP's *next* connection attempt.
+// only blocking that IP's *next* connection attempt. Deliberately
+// local-instance-only (out of scope for the Redis cluster work in
+// cluster.ts — see moderationStore.ts's own in-memory cache, which is
+// Mongo/disk-synced but not cross-instance-invalidated in real time
+// either): a ban still blocks every instance's *next* connection check
+// (isIpBanned, at the "/ws" upgrade below) immediately, it just doesn't
+// instantly kick an already-open socket on an instance other than the one
+// the admin's request happened to land on.
 function disconnectClientsByIp(ip: string) {
   for (const info of clients.values()) {
     if (info.ip === ip) {
       info.socket.close(BANNED_CLOSE_CODE, "ip-banned");
     }
   }
+}
+
+// Resolves whatever identity currently owns `peerId`, wherever it lives —
+// checks this instance's local clientsById first (no Redis round trip for
+// the common same-instance case), falling back to cluster.ts's registry
+// for a peer hosted elsewhere. Used by both "register"'s and "join"'s
+// reclaim checks so the ownership rule (isSameOwner) never has to care
+// which instance actually holds the session it's comparing against.
+async function resolveOwnerIdentity(peerId: string): Promise<OwnerIdentity | null> {
+  const local = clientsById.get(peerId);
+  if (local) return local;
+  return getClientRecord(peerId);
+}
+
+// Takes over `clientId`'s session, wherever it currently lives: detaches it
+// immediately if it's local to this instance, or asks whichever instance
+// actually holds it to do so via cluster.ts's per-client channel otherwise
+// (fire-and-forget — the challenger doesn't wait for that instance's
+// cleanup to finish before claiming the id itself, matching how the local
+// path's detachSession call was never awaited-to-completion by its
+// caller's *own* side-effects either, just sequenced before them).
+async function reclaimClient(clientId: string): Promise<void> {
+  const local = clientsById.get(clientId);
+  if (local) {
+    await detachSession(local);
+  } else {
+    await publishToClient(clientId, { type: "reclaim" });
+  }
+}
+
+// Creates (or reuses) this instance's local RoomInfo cache for `room` —
+// shared by "join" and "admin-join". Loads whatever chat history is
+// already persisted (Redis/disk, via chatStore.ts) the first time *this*
+// instance sees the room, and subscribes to cluster.ts's room broadcast
+// channel so events from peers on other instances get relayed to this
+// instance's own local sockets (see handleRoomChannelMessage).
+async function ensureLocalRoom(room: string): Promise<RoomInfo> {
+  const existing = rooms.get(room);
+  if (existing) return existing;
+  const messages = await loadPersistedChat(room);
+  // The await above gave a concurrent "join" for this same, brand-new room
+  // on this instance a chance to land first — don't clobber a RoomInfo
+  // that already showed up while we were loading.
+  let roomInfo = rooms.get(room);
+  if (!roomInfo) {
+    roomInfo = { sockets: new Set(), messages };
+    rooms.set(room, roomInfo);
+    await subscribeRoomChannel(room, (m) => handleRoomChannelMessage(room, m));
+  }
+  return roomInfo;
+}
+
+// Applies one chat message to a room's local history cache, capped at
+// ROOM_CHAT_HISTORY_LIMIT — shared by the local "chat" sender path and
+// handleRoomChannelMessage below, so the cache stays correct regardless of
+// whether a given message originated on this instance or was relayed from
+// another one over cluster.ts's room channel.
+function applyChatMessageToCache(roomInfo: RoomInfo, chatMessage: ChatMessage) {
+  roomInfo.messages.push(chatMessage);
+  if (roomInfo.messages.length > ROOM_CHAT_HISTORY_LIMIT) {
+    roomInfo.messages.splice(0, roomInfo.messages.length - ROOM_CHAT_HISTORY_LIMIT);
+  }
+}
+
+// Delivers a room event relayed from another instance to every socket this
+// instance has locally in `room` — cluster.ts's subscribeRoomChannel
+// already filters out this instance's own publishes (they were delivered
+// directly by broadcastToRoomCluster's local call already), so everything
+// reaching here genuinely originated elsewhere and needs no exclusion.
+function handleRoomChannelMessage(room: string, msg: unknown) {
+  const roomInfo = rooms.get(room);
+  if (!roomInfo) return;
+  if (msg && typeof msg === "object" && (msg as { type?: unknown }).type === "chat-message") {
+    const { type: _type, ...chatMessage } = msg as { type: string } & ChatMessage;
+    applyChatMessageToCache(roomInfo, chatMessage);
+  }
+  for (const s of roomInfo.sockets) send(s, msg);
+}
+
+// Broadcasts `msg` to this room across every instance: delivers to this
+// instance's own local sockets exactly like the old broadcastToRoom always
+// did (still excludes the sender's own socket — other instances never have
+// that socket anyway, so no exclusion is needed on their side), and
+// publishes it for every other instance's handleRoomChannelMessage to
+// relay to *their* local sockets.
+async function broadcastToRoomCluster(room: string, msg: unknown, exclude?: WebSocket): Promise<void> {
+  broadcastToRoom(room, msg, exclude);
+  await publishRoomEvent(room, msg);
+}
+
+// Applies an incoming message on this connection's per-client Redis
+// channel (see subscribeClientChannel in the "register" handler below): a
+// relayed WebRTC signal is delivered straight to this socket, and a
+// reclaim (another instance's connection taking over this exact clientId)
+// detaches this session — see detachSession's comment for why that's safe
+// to do unconditionally here.
+function handleClientChannelMessage(info: ClientInfo, msg: ClientChannelMessage) {
+  if (msg.type === "signal") {
+    send(info.socket, { type: "signal", from: msg.from, data: msg.data });
+  } else if (msg.type === "reclaim") {
+    void detachSession(info);
+  }
+}
+
+// Primes this instance's local announcement copy from whatever's currently
+// persisted in Redis, then keeps it in sync forever after via cluster.ts's
+// announcement channel — called once at startup (see server/index.ts)
+// after connectCluster resolves.
+export async function initClusterAnnouncementSync(): Promise<void> {
+  currentAnnouncement = (await getStoredAnnouncement()) as Announcement | null;
+  await subscribeAnnouncementChannel((announcement) => {
+    currentAnnouncement = announcement as Announcement | null;
+    broadcastToAll({ type: "announcement", announcement: currentAnnouncement });
+  });
 }
 
 export function registerSignalingRoutes(app: FastifyInstance, genId: () => string) {
@@ -510,12 +736,6 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // periodic traffic that keeps idle-timeout proxies from killing the
   // connection in the first place.
   const heartbeat = setInterval(() => {
-    const now = Date.now();
-    for (const [targetId, queue] of pendingSignals) {
-      const fresh = queue.filter((item) => now - item.queuedAt <= PENDING_SIGNAL_TTL_MS);
-      if (fresh.length === 0) pendingSignals.delete(targetId);
-      else if (fresh.length !== queue.length) pendingSignals.set(targetId, fresh);
-    }
     for (const info of clients.values()) {
       if (!info.isAlive) {
         heartbeatReapedTotal.inc();
@@ -524,6 +744,18 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       }
       info.isAlive = false;
       info.socket.ping();
+      // Piggybacks the Redis presence-TTL renewal (cluster.ts's
+      // PRESENCE_TTL_MS) on this same tick, for every client this instance
+      // still has alive — fire-and-forget, same as the rest of this
+      // file's persistence calls: a missed renewal here just means this
+      // peer's roster/registry entry expires a little earlier than usual
+      // if the *next* tick also fails, not an immediate problem. This is
+      // what makes a peer's presence actually go away within ~90s if this
+      // instance dies without ever running leaveRoom/detachSession (crash,
+      // OOM-kill, SIGKILL) instead of leaving a permanent "ghost" — see
+      // PRESENCE_TTL_MS's comment.
+      if (info.name !== null) void touchClientHeartbeat(info.id);
+      if (info.room) void touchRoomPeerHeartbeat(info.room, info.id);
     }
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -542,25 +774,26 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // visitor's polling loop needs, tuned against a scripted hammering loop
   // instead.
   app.get("/stats", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
+    const allRooms = await listAllRooms();
     let peopleOnline = 0;
-    for (const info of rooms.values()) peopleOnline += realPeopleCount(info);
+    for (const r of allRooms) peopleOnline += r.peopleCount;
     return { peopleOnline };
   });
 
   // Public room directory. Private rooms (handle starts with "priv-") are
   // filtered out here, server-side — the client never receives them, so
   // there's no separate access-control step to forget on the frontend.
+  // Sourced from cluster.ts's Redis roster (listAllRooms) rather than this
+  // instance's local `rooms` Map, so the directory reflects every instance,
+  // not just whichever one happened to answer this request.
   //
   // Same reasoning/limit as /stats: public, cheap, polled by the room
   // browser UI on a normal cadence.
   app.get("/rooms", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
-    const publicRooms = [...rooms.entries()]
-      .filter(([handle]) => !isPrivateRoom(handle))
-      .map(([handle, info]) => ({
-        handle,
-        peopleCount: realPeopleCount(info),
-        createdAt: info.createdAt,
-      }))
+    const allRooms = await listAllRooms();
+    const publicRooms = allRooms
+      .filter((r) => !isPrivateRoom(r.handle))
+      .map((r) => ({ handle: r.handle, peopleCount: r.peopleCount, createdAt: r.createdAt }))
       .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
     return { rooms: publicRooms };
   });
@@ -640,16 +873,15 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
-    const allRooms = [...rooms.entries()]
-      .map(([handle, info]) => ({
-        handle,
-        isPrivate: isPrivateRoom(handle),
-        createdAt: info.createdAt,
-        peopleCount: realPeopleCount(info),
-        peers: [...info.sockets]
-          .map((s) => clients.get(s))
-          .filter((c): c is ClientInfo => c !== undefined && !c.isModerator)
-          .map((c) => ({ id: c.id, name: c.name, sharing: c.sharing, mic: c.mic, ip: c.ip })),
+    const allRooms = (await listAllRooms())
+      .map((r) => ({
+        handle: r.handle,
+        isPrivate: isPrivateRoom(r.handle),
+        createdAt: r.createdAt,
+        peopleCount: r.peopleCount,
+        peers: r.peers
+          .filter((p) => !p.isModerator)
+          .map((p) => ({ id: p.id, name: p.name, sharing: p.sharing, mic: p.mic, ip: p.ip })),
       }))
       .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
     return { rooms: allRooms };
@@ -706,7 +938,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       return reply.code(400).send({ error: "Link inválido — use uma URL http(s) completa." });
     }
 
-    currentAnnouncement = {
+    const announcement: Announcement = {
       id: genId(),
       text,
       buttonLabel,
@@ -715,16 +947,22 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       color: color as AnnouncementColor,
       dismissible,
     };
-    broadcastToAll({ type: "announcement", announcement: currentAnnouncement });
-    return { announcement: currentAnnouncement };
+    // Publishing (rather than assigning currentAnnouncement + broadcastToAll
+    // directly here) is deliberately the *only* way an announcement change
+    // ever takes effect — see initClusterAnnouncementSync, whose
+    // subscription handler is what actually updates currentAnnouncement and
+    // broadcasts, on every instance including this one. One code path means
+    // there's no way for this instance's own view of currentAnnouncement to
+    // ever diverge from what it just published.
+    await publishAnnouncement(announcement);
+    return { announcement };
   });
 
   app.delete("/admin/announcement", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
-    currentAnnouncement = null;
-    broadcastToAll({ type: "announcement", announcement: null });
+    await publishAnnouncement(null);
     return reply.code(204).send();
   });
 
@@ -734,17 +972,23 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
+    const allRooms = await listAllRooms();
     let peopleOnline = 0;
     let sharingCount = 0;
     let publicRooms = 0;
     let privateRooms = 0;
-    for (const [handle, info] of rooms) {
-      peopleOnline += realPeopleCount(info);
-      sharingCount += realSharingCount(info);
-      if (isPrivateRoom(handle)) privateRooms += 1;
+    for (const r of allRooms) {
+      peopleOnline += r.peopleCount;
+      sharingCount += r.sharingCount;
+      if (isPrivateRoom(r.handle)) privateRooms += 1;
       else publicRooms += 1;
     }
     return {
+      // Local to this instance only (unlike every other number in this
+      // response) — out of scope for the realtime-state cluster work in
+      // cluster.ts, same carve-out as server/metrics.ts. In a multi-instance
+      // deployment this reflects only the instance that answered this
+      // request, not the whole cluster.
       connectedSockets: clients.size,
       peopleOnline,
       sharingCount,
@@ -975,26 +1219,36 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // Renaming while already in a room doesn't go through "join"
           // again, so the room-scoped name collision "join" normally checks
           // (see below) has to be checked here instead — the same name
-          // could already be held by someone else in *this* room.
+          // could already be held by someone else in *this* room. Sourced
+          // from cluster.ts's Redis room-names hash (not a local Map), since
+          // whoever holds it could be on a different instance.
           if (info.room) {
-            const roomInfo = rooms.get(info.room);
-            const holderSocket = roomInfo?.names.get(key);
-            const holder = holderSocket && holderSocket !== socket ? clients.get(holderSocket) : undefined;
-            if (holder && !isSameOwner(holder, info)) {
-              registerErrorsTotal.inc();
-              send(socket, { type: "register-error", message: "Esse nome já está em uso nesta sala." });
-              return;
+            const holderId = await getRoomNameHolder(info.room, key);
+            if (holderId && holderId !== info.id) {
+              const holderRecord = await resolveOwnerIdentity(holderId);
+              if (holderRecord && !isSameOwner(holderRecord, info)) {
+                registerErrorsTotal.inc();
+                send(socket, { type: "register-error", message: "Esse nome já está em uso nesta sala." });
+                return;
+              }
             }
           }
 
           const previousName = info.name;
           info.name = rawName;
           if (info.room) {
-            const roomInfo = rooms.get(info.room);
-            if (roomInfo) {
-              if (previousName) roomInfo.names.delete(previousName.toLowerCase());
-              roomInfo.names.set(key, socket);
-            }
+            if (previousName) await releaseRoomName(info.room, previousName.toLowerCase(), info.id);
+            await reserveRoomName(info.room, key, info.id);
+            await upsertRoomPeer(info.room, {
+              id: info.id,
+              name: rawName,
+              sharing: info.sharing,
+              mic: info.mic,
+              userId: stableUserId(info),
+              ...(info.isModerator ? { isModerator: true as const } : {}),
+              ip: info.ip,
+              instanceId: clusterInstanceId,
+            });
           }
 
           // A client-supplied id (persisted client-side across reloads) lets
@@ -1009,27 +1263,58 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // it — the old, pre-token model) still trusts a bare id match by
           // default, to keep working exactly as it always has for clients
           // that don't know about tokens at all — see
-          // ALLOW_OLD_CLIENTS_GUEST_SYSTEM.
+          // ALLOW_OLD_CLIENTS_GUEST_SYSTEM. Checked first against this
+          // instance's local clientsById (no Redis round trip for the common
+          // case), falling back to cluster.ts's registry for a session that
+          // lives on a different instance.
           const requestedClientId = typeof msg.clientId === "string" ? msg.clientId : "";
           const clientId = CLIENT_ID_RE.test(requestedClientId) ? requestedClientId : null;
           if (clientId && clientId !== info.id) {
             const existingById = clientsById.get(clientId);
-            if (!existingById) {
-              if (clientsById.get(info.id) === info) clientsById.delete(info.id);
-              info.id = clientId;
-            } else if (existingById.socket !== socket) {
-              const existingProtected =
-                !ALLOW_OLD_CLIENTS_GUEST_SYSTEM || Boolean(existingById.accountId) || existingById.guestVerified;
-              if (!existingProtected || isSameOwner(existingById, info)) {
-                detachSession(existingById);
-                if (clientsById.get(info.id) === info) clientsById.delete(info.id);
-                info.id = clientId;
+            let claim = false;
+            if (existingById) {
+              if (existingById.socket !== socket) {
+                const existingProtected =
+                  !ALLOW_OLD_CLIENTS_GUEST_SYSTEM || Boolean(existingById.accountId) || existingById.guestVerified;
+                claim = !existingProtected || isSameOwner(existingById, info);
+                if (claim) await detachSession(existingById);
+                // else: someone else's protected session — ignore the
+                // requested id and keep our own freshly generated one.
               }
-              // else: someone else's protected session — ignore the
-              // requested id and keep our own freshly generated one.
+            } else {
+              const remoteRecord = await getClientRecord(clientId);
+              if (!remoteRecord) {
+                claim = true;
+              } else {
+                const existingProtected =
+                  !ALLOW_OLD_CLIENTS_GUEST_SYSTEM || Boolean(remoteRecord.accountId) || remoteRecord.guestVerified;
+                claim = !existingProtected || isSameOwner(remoteRecord, info);
+                if (claim) await publishToClient(clientId, { type: "reclaim" });
+              }
+            }
+            if (claim) {
+              if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+              await deleteClientRecordIfOwn(info.id, info.registryEpoch);
+              if (info.clientChannelId) {
+                await unsubscribeClientChannel(info.clientChannelId);
+                info.clientChannelId = undefined;
+              }
+              info.id = clientId;
             }
           }
           clientsById.set(info.id, info);
+          if (info.clientChannelId !== info.id) {
+            if (info.clientChannelId) await unsubscribeClientChannel(info.clientChannelId);
+            await subscribeClientChannel(info.id, (m: ClientChannelMessage) => handleClientChannelMessage(info, m));
+            info.clientChannelId = info.id;
+          }
+          info.registryEpoch = await setClientRecord(info.id, {
+            instanceId: clusterInstanceId,
+            accountId: info.accountId,
+            guestId: info.guestId,
+            guestVerified: info.guestVerified,
+            room: info.room,
+          });
 
           send(socket, {
             type: "registered",
@@ -1047,7 +1332,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // again, so nothing else would tell the other participants —
           // without this their peer list would keep showing the old name.
           if (info.room && previousName && previousName !== rawName) {
-            broadcastToRoom(info.room, { type: "peer-renamed", id: info.id, name: rawName }, socket);
+            await broadcastToRoomCluster(info.room, { type: "peer-renamed", id: info.id, name: rawName }, socket);
           }
           break;
         }
@@ -1078,55 +1363,62 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // never collide this way (this check is scoped to `room` alone),
           // and a stranger presenting the same name they can see in the
           // room's peer list is turned away without touching the person
-          // already there.
+          // already there. Sourced from cluster.ts's Redis room-names hash,
+          // since the holder could be on a different instance.
           const nameKey = info.name.toLowerCase();
-          const existingRoomInfo = rooms.get(room);
-          const holderSocket = existingRoomInfo?.names.get(nameKey);
-          if (holderSocket && holderSocket !== socket) {
-            const holder = clients.get(holderSocket);
-            if (holder && isSameOwner(holder, info)) {
-              detachSession(holder);
+          const holderId = await getRoomNameHolder(room, nameKey);
+          if (holderId && holderId !== info.id) {
+            const holderRecord = await resolveOwnerIdentity(holderId);
+            if (holderRecord && isSameOwner(holderRecord, info)) {
+              await reclaimClient(holderId);
             } else {
               send(socket, { type: "join-error", message: "Esse nome já está em uso nesta sala." });
               return;
             }
           }
 
-          if (info.room) leaveRoom(info);
+          if (info.room) await leaveRoom(info);
           clearRoomDeletionTimer(room);
           info.room = room;
           info.sharing = false;
           info.mic = false;
-          let roomInfo = rooms.get(room);
-          if (!roomInfo) {
-            // Reloads any chat history still persisted (chatStore.ts) from
-            // before the room last emptied out or the process last
-            // restarted. Awaiting here means another client's "join" for
-            // this same brand-new room could land while we wait — re-check
-            // after, so we don't clobber a RoomInfo that landed first.
-            const messages = await loadPersistedChat(room);
-            roomInfo = rooms.get(room);
-            if (!roomInfo) {
-              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages, names: new Map() };
-              rooms.set(room, roomInfo);
-              roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
-            }
-          }
-          // The await above gave this socket's own "leave"/another "join"
+
+          // Measured before this peer is added below, so a room that only
+          // gained a *moderator* presence via admin-join (never counted as
+          // "created") still counts as a fresh creation here — matches the
+          // original local-RoomInfo-didn't-exist-yet trigger for
+          // roomsCreatedTotal, just decided from the cross-instance roster
+          // instead of this instance's own local cache.
+          const wasEmpty = (await roomCounts(room)).people === 0;
+          const roomInfo = await ensureLocalRoom(room);
+
+          // The awaits above gave this socket's own "leave"/another "join"
           // a chance to run first and move it elsewhere (or the socket
           // could've closed outright) — don't add it to a room it's no
           // longer trying to join.
           if (info.room !== room || !clients.has(socket)) return;
+
           roomInfo.sockets.add(socket);
-          roomInfo.names.set(nameKey, socket);
-          const peers = [...roomInfo.sockets]
-            .filter((s) => s !== socket)
-            .map((s) => clients.get(s))
-            .filter((c): c is ClientInfo => c !== undefined)
-            .map(peerSummary);
+          await reserveRoomName(room, nameKey, info.id);
+          await upsertRoomPeer(room, {
+            id: info.id,
+            name: info.name,
+            sharing: info.sharing,
+            mic: info.mic,
+            userId: stableUserId(info),
+            ip: info.ip,
+            instanceId: clusterInstanceId,
+          });
+          if (wasEmpty) roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
+
+          const peers = (await getRoomPeers(room)).filter((p) => p.id !== info.id).map(toWirePeer);
           send(socket, { type: "room-state", room, selfId: info.id, peers, messages: roomInfo.messages });
-          flushPendingSignals(info);
-          broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name }, socket);
+          await flushPendingSignalsFor(info);
+          await broadcastToRoomCluster(
+            room,
+            { type: "peer-joined", id: info.id, name: info.name, userId: stableUserId(info) },
+            socket
+          );
           break;
         }
         // A moderator entering a room to watch/listen for moderation.
@@ -1155,24 +1447,46 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             send(socket, { type: "error", message: "Sala inválida." });
             return;
           }
-          const roomInfo = rooms.get(room);
-          if (!roomInfo) {
+          // Cross-instance existence check (Redis), not this instance's own
+          // local `rooms` Map — a moderator connecting to a different
+          // instance than the room's participants can now watch it too.
+          // Counts *any* peer, moderators included — a room a real
+          // participant created can otherwise keep existing purely because
+          // a lingering moderator is still in it (same as the original
+          // local-only `rooms.get(room)` check, which never distinguished
+          // who was still there), and a second moderator should still be
+          // able to join that room too.
+          const roomExists = (await getRoomPeers(room)).length > 0;
+          if (!roomExists) {
             send(socket, { type: "error", message: "Sala não encontrada ou já encerrada." });
             return;
           }
           if (info.room === room) return;
-          if (info.room) leaveRoom(info);
+          if (info.room) await leaveRoom(info);
           info.isModerator = true;
           info.name = info.name ?? "Moderador";
           info.room = room;
           info.sharing = false;
           info.mic = false;
+          const roomInfo = await ensureLocalRoom(room);
+          if (info.room !== room || !clients.has(socket)) return;
           roomInfo.sockets.add(socket);
-          const adminPeers = [...roomInfo.sockets]
-            .filter((s) => s !== socket)
-            .map((s) => clients.get(s))
-            .filter((c): c is ClientInfo => c !== undefined)
-            .map(peerSummary);
+          // Moderators ride the same roster as real participants (see the
+          // comment above) — they need to appear in every real peer's
+          // cross-instance peers list too, tagged isModerator, so
+          // broadcasters' "open a connection to every peer I see" logic
+          // reaches them the same way it would a real participant.
+          await upsertRoomPeer(room, {
+            id: info.id,
+            name: info.name,
+            sharing: false,
+            mic: false,
+            isModerator: true,
+            userId: stableUserId(info),
+            ip: info.ip,
+            instanceId: clusterInstanceId,
+          });
+          const adminPeers = (await getRoomPeers(room)).filter((p) => p.id !== info.id).map(toWirePeer);
           send(socket, {
             type: "room-state",
             room,
@@ -1180,12 +1494,16 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             peers: adminPeers,
             messages: roomInfo.messages,
           });
-          flushPendingSignals(info);
-          broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name, role: "moderator" }, socket);
+          await flushPendingSignalsFor(info);
+          await broadcastToRoomCluster(
+            room,
+            { type: "peer-joined", id: info.id, name: info.name, role: "moderator", userId: stableUserId(info) },
+            socket
+          );
           break;
         }
         case "leave": {
-          if (info.room) leaveRoom(info);
+          if (info.room) await leaveRoom(info);
           break;
         }
         case "sharing": {
@@ -1195,14 +1513,34 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // real toggle just propagates normally once the window resets.
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
           info.sharing = Boolean(msg.sharing);
-          broadcastToRoom(info.room, { type: "peer-sharing", id: info.id, sharing: info.sharing });
+          await upsertRoomPeer(info.room, {
+            id: info.id,
+            name: info.name,
+            sharing: info.sharing,
+            mic: info.mic,
+            userId: stableUserId(info),
+            ...(info.isModerator ? { isModerator: true as const } : {}),
+            ip: info.ip,
+            instanceId: clusterInstanceId,
+          });
+          await broadcastToRoomCluster(info.room, { type: "peer-sharing", id: info.id, sharing: info.sharing });
           break;
         }
         case "mic": {
           if (!info.room) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
           info.mic = Boolean(msg.mic);
-          broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
+          await upsertRoomPeer(info.room, {
+            id: info.id,
+            name: info.name,
+            sharing: info.sharing,
+            mic: info.mic,
+            userId: stableUserId(info),
+            ...(info.isModerator ? { isModerator: true as const } : {}),
+            ip: info.ip,
+            instanceId: clusterInstanceId,
+          });
+          await broadcastToRoomCluster(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
           break;
         }
         case "chat": {
@@ -1254,12 +1592,13 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           }
           const roomInfo = rooms.get(info.room);
           if (!roomInfo) return;
-          roomInfo.messages.push(chatMessage);
-          if (roomInfo.messages.length > ROOM_CHAT_HISTORY_LIMIT) {
-            roomInfo.messages.splice(0, roomInfo.messages.length - ROOM_CHAT_HISTORY_LIMIT);
-          }
-          savePersistedChat(info.room, roomInfo.messages);
-          broadcastToRoom(info.room, { type: "chat-message", ...chatMessage });
+          applyChatMessageToCache(roomInfo, chatMessage);
+          // Fire-and-forget, same as the rest of this codebase's
+          // persistence calls (see e.g. deletePersistedChat below) — chat
+          // already reached every peer via broadcastToRoomCluster below
+          // regardless of whether/when this write lands.
+          void appendPersistedChat(info.room, chatMessage, ROOM_CHAT_HISTORY_LIMIT);
+          await broadcastToRoomCluster(info.room, { type: "chat-message", ...chatMessage });
           break;
         }
         case "signal": {
@@ -1278,7 +1617,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
               ? String((msg.data as { kind: unknown }).kind)
               : "unknown";
           signalsRelayedTotal.inc({ kind: dataKind });
-          deliverOrQueueSignal(info.room, targetId, info.id, msg.data);
+          await deliverOrQueueSignal(info.room, targetId, info.id, msg.data);
           break;
         }
         default:
@@ -1288,14 +1627,18 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
 
     socket.on("close", () => {
       wsDisconnectionsTotal.inc();
-      // leaveRoom guards its own roomInfo.names cleanup against a
+      // leaveRoom guards its own name/roster cleanup against a
       // stale/superseded session's delayed close event wiping out a newer
-      // reconnect that already took over this name/id (it only ever deletes
-      // its *own* socket's reservation).
-      if (info.room) leaveRoom(info);
+      // reconnect that already took over this name/id (it only ever removes
+      // its *own* socket's reservation) — see leaveRoom/detachSession.
+      if (info.room) void leaveRoom(info);
       if (clientsById.get(info.id) === info) {
         clientsById.delete(info.id);
-        pendingSignals.delete(info.id);
+        void deleteClientRecordIfOwn(info.id, info.registryEpoch);
+      }
+      if (info.clientChannelId) {
+        void unsubscribeClientChannel(info.clientChannelId);
+        info.clientChannelId = undefined;
       }
       clients.delete(socket);
     });
