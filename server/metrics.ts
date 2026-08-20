@@ -12,7 +12,6 @@ export type RoomStats = {
   sharingCount: number;
   isPrivate: boolean;
 };
-
 // A breakdown of registeredPeers by what kind of identity backs them — see
 // server/signaling.ts's ClientInfo (accountId/guestId/guestVerified) and its
 // "register" handler for what each of these actually means:
