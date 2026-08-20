@@ -1602,9 +1602,19 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const turnstileStillFresh =
             info.turnstileVerifiedAt !== undefined &&
             Date.now() - info.turnstileVerifiedAt < TURNSTILE_REVERIFY_INTERVAL_MS;
-          if (TURNSTILE_ENABLED && !turnstileStillFresh) {
-            const token = typeof msg.turnstileToken === "string" ? msg.turnstileToken : "";
-            const verified = await verifyTurnstileToken(token, info.ip);
+          const turnstileToken = typeof msg.turnstileToken === "string" ? msg.turnstileToken : "";
+          // While TURNSTILE_ENABLED is off, a token is never *required* — an
+          // older client that's never heard of Turnstile sends nothing at
+          // all and is let straight through, which is the whole point of
+          // keeping it off until every client is known to send one. But an
+          // already-updated client that does send a token still gets it
+          // fully verified and enforced here regardless, rather than that
+          // check being silently skipped — there's no backward-compat
+          // reason to wave through a client that's actively claiming to have
+          // passed the challenge.
+          const mustVerifyTurnstile = !turnstileStillFresh && (TURNSTILE_ENABLED || turnstileToken.length > 0);
+          if (mustVerifyTurnstile) {
+            const verified = await verifyTurnstileToken(turnstileToken, info.ip);
             turnstileVerificationsTotal.inc({ result: verified ? "success" : "failure" });
             if (!verified) {
               send(socket, {

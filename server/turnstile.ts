@@ -6,13 +6,16 @@
 //     Unset (local dev, or before the front-end widget exists) and
 //     verifyTurnstileToken below just passes everyone through, same
 //     pattern as MONGO_ENABLED/METRICS_TOKEN elsewhere in this server.
-//   - TURNSTILE_ENABLED=true: actually *enforces* it (see TURNSTILE_ENABLED
-//     below and its use in signaling.ts's "join" handler) — kept separate
-//     from the secret key so the key + front-end widget can be deployed and
-//     exercised first without immediately rejecting anyone. Older,
-//     not-yet-updated clients never send a token at all, so flipping
-//     enforcement on the moment the key is configured would lock all of
-//     them out; this way it only turns on once someone deliberately does so.
+//   - TURNSTILE_ENABLED=true: makes a token *mandatory* — see
+//     signaling.ts's "join" handler. Kept separate from the secret key so
+//     the key + front-end widget can be deployed and exercised first
+//     without immediately rejecting anyone. While this is off, a client
+//     that sends no token at all (an older one that's never heard of
+//     Turnstile) is let straight through — but a client that *does* send
+//     one is still fully verified and enforced regardless of this flag,
+//     since there's no backward-compat reason to wave through someone
+//     actively claiming to have passed the challenge. This flag only
+//     changes whether *not sending a token at all* is tolerated.
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || null;
 export const TURNSTILE_ENABLED = process.env.TURNSTILE_ENABLED === "true" && TURNSTILE_SECRET_KEY !== null;
 
