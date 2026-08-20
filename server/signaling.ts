@@ -36,6 +36,12 @@ import {
   type AnnouncementSound,
 } from "./announcementStore.js";
 import {
+  loadPersistedPartnerConfig,
+  savePersistedPartnerConfig,
+  type Partner,
+  type PartnerConfig,
+} from "./partnerStore.js";
+import {
   isIpBanned,
   isValidIp,
   listBans,
@@ -62,6 +68,9 @@ const HEARTBEAT_INTERVAL_MS = 25_000;
 const CHAT_MAX_LEN = 500;
 const ANNOUNCEMENT_TEXT_MAX_LEN = 300;
 const ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN = 40;
+const PARTNER_TITLE_MAX_LEN = 80;
+const PARTNER_DESCRIPTION_MAX_LEN = 400;
+const PARTNER_BUTTON_LABEL_MAX_LEN = 40;
 const BAN_REASON_MAX_LEN = 200;
 // Close code used to reject a connection from a banned IP — distinct from
 // SUPERSEDED_CLOSE_CODE below so the client can tell them apart and show the
@@ -245,6 +254,138 @@ const ROOM_DELETION_GRACE_MS = 20_000;
 // while it's up.
 let currentAnnouncement: Announcement | null = null;
 
+// Sidebar partner-ad slot (see components/PartnerCard.tsx) — unlike the
+// announcement banner above, more than one can be active at once (see
+// activePartners/pickWeightedPartner/assignPartnersToConnections below for
+// how one gets chosen for a given request/connection). Loaded from
+// partnerStore.js at startup, just like currentAnnouncement.
+let partnerConfig: PartnerConfig = { partners: [], emptyPercent: 0 };
+
+// Real-time engagement counters per partner ad, keyed by id — mirrors
+// AnnouncementStatsEntry above (same viewerIds-dedupe-by-connection
+// reasoning), but per-partner rather than a single active slot, and kept
+// around for as long as the partner itself exists in partnerConfig.partners
+// (including past its expiresAt — see Partner.expiresAt's doc comment)
+// rather than being wholesale-reset the way announcementStats is.
+interface PartnerStatsEntry {
+  viewerIds: Set<string>;
+  clicks: number;
+}
+const partnerStats = new Map<string, PartnerStatsEntry>();
+
+function getPartnerStats(id: string): PartnerStatsEntry {
+  let entry = partnerStats.get(id);
+  if (!entry) {
+    entry = { viewerIds: new Set(), clicks: 0 };
+    partnerStats.set(id, entry);
+  }
+  return entry;
+}
+
+function partnerStatsSummary(id: string) {
+  const entry = partnerStats.get(id);
+  return { views: entry?.viewerIds.size ?? 0, clicks: entry?.clicks ?? 0 };
+}
+
+// Partners whose expiresAt hasn't passed yet — the only ones eligible for
+// selection (HTTP or socket). An expired partner stays in partnerConfig.partners
+// (see its doc comment) but never shows up here again.
+function activePartners(): Partner[] {
+  const now = Date.now();
+  return partnerConfig.partners.filter((p) => p.expiresAt === null || p.expiresAt > now);
+}
+
+// One weighted-random pick for a single HTTP request — independent per
+// call, so across many requests the split between partners converges to
+// their relative weights (see Partner.weight's doc comment) without needing
+// to know how many other requests are happening concurrently, unlike
+// assignPartnersToConnections below which deals with a fixed, known set of
+// connections all at once.
+function pickWeightedPartner(pool: Partner[]): Partner | null {
+  if (pool.length === 0) return null;
+  const totalWeight = pool.reduce((sum, p) => sum + p.weight, 0);
+  if (totalWeight <= 0) return pool[Math.floor(Math.random() * pool.length)];
+  let roll = Math.random() * totalWeight;
+  for (const p of pool) {
+    roll -= p.weight;
+    if (roll <= 0) return p;
+  }
+  return pool[pool.length - 1]; // floating-point fallback, should be unreachable
+}
+
+// Only the fields a visitor actually needs — weight/createdAt are admin
+// bookkeeping, not part of what gets rendered or sent over the wire to a
+// regular client.
+function publicPartner(p: Partner) {
+  return {
+    id: p.id,
+    title: p.title,
+    description: p.description,
+    imageUrl: p.imageUrl,
+    buttonLabel: p.buttonLabel,
+    buttonUrl: p.buttonUrl,
+    backgroundColor: p.backgroundColor,
+    textColor: p.textColor,
+    buttonBackgroundColor: p.buttonBackgroundColor,
+    buttonTextColor: p.buttonTextColor,
+    expiresAt: p.expiresAt,
+  };
+}
+
+// Splits `count` connections across `pool` proportionally to weight, using
+// the largest-remainder method so the split is exact (not just
+// probabilistically close, the way independent per-request random picks —
+// see pickWeightedPartner — would be for a small connection count) even
+// when count doesn't divide evenly. Order is shuffled afterward so which
+// *specific* connections land on which partner isn't correlated with
+// pool/iteration order every time this runs. Returns an array of length
+// `count`; empty pool returns an all-null array.
+function assignPartnersToConnections(pool: Partner[], count: number): (Partner | null)[] {
+  if (count === 0) return [];
+  if (pool.length === 0) return new Array(count).fill(null);
+  const totalWeight = pool.reduce((sum, p) => sum + p.weight, 0);
+  const shares = pool.map((p) => (totalWeight > 0 ? (p.weight / totalWeight) * count : count / pool.length));
+  const bucketCounts = shares.map((s) => Math.floor(s));
+  let assigned = bucketCounts.reduce((sum, n) => sum + n, 0);
+  const remainders = shares
+    .map((s, i) => ({ i, remainder: s - bucketCounts[i] }))
+    .sort((a, b) => b.remainder - a.remainder);
+  let r = 0;
+  while (assigned < count) {
+    bucketCounts[remainders[r % remainders.length].i] += 1;
+    assigned += 1;
+    r += 1;
+  }
+  const bag: Partner[] = [];
+  pool.forEach((p, i) => {
+    for (let k = 0; k < bucketCounts[i]; k += 1) bag.push(p);
+  });
+  for (let i = bag.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [bag[i], bag[j]] = [bag[j], bag[i]];
+  }
+  return bag;
+}
+
+// Pushes a fresh partner assignment to *every* currently connected socket —
+// called after every admin create/edit/delete so already-open tabs update
+// immediately, without waiting for a reload. Deliberately bypasses
+// partnerConfig.emptyPercent entirely (that only governs the HTTP GET
+// /partner roll for a brand new/reloaded page — see the route below) and
+// deliberately doesn't scope to non-moderator/registered connections the
+// way room broadcasts do, matching broadcastToAll's announcement semantics:
+// any open socket might have a PartnerCard mounted, and one that doesn't
+// simply ignores a message type it has no handler for.
+function broadcastPartnerUpdate() {
+  const pool = activePartners();
+  const sockets = [...clients.keys()];
+  const assignment = assignPartnersToConnections(pool, sockets.length);
+  sockets.forEach((socket, i) => {
+    const partner = assignment[i];
+    send(socket, { type: "partner", partner: partner ? publicPartner(partner) : null });
+  });
+}
+
 // A WebRTC offer/answer/ICE candidate is only useful for a few seconds, but
 // `send()` below silently drops it if the target's socket isn't OPEN right
 // then — which happens constantly on mobile (screen lock, wifi/cell
@@ -317,10 +458,11 @@ function isValidGifUrl(url: string): boolean {
   return parsed.protocol === "https:" && parsed.hostname.endsWith(".giphy.com");
 }
 
-// Same control-character guard as isValidDisplayName (no newlines — the
-// banner is meant to be short), parameterized on max length since it's
-// reused for both the announcement text and its button label.
-function isValidAnnouncementField(text: string, maxLen: number): boolean {
+// Same control-character guard as isValidDisplayName (no newlines — these
+// are meant to be short single-line fields), parameterized on max length —
+// reused for the announcement text/button label and the partner ad's
+// title/description/button label.
+function isValidShortText(text: string, maxLen: number): boolean {
   if (text.length < 1 || text.length > maxLen) return false;
   for (let i = 0; i < text.length; i += 1) {
     const code = text.charCodeAt(i);
@@ -330,16 +472,29 @@ function isValidAnnouncementField(text: string, maxLen: number): boolean {
 }
 
 // Restricted to http(s) so a "javascript:" (or other) URL scheme can never
-// reach the button's href/window.open target — this URL comes straight from
-// an admin-supplied form field and gets used client-side without further
+// reach a button's href/window.open target or an <img src> — this comes
+// straight from an admin-supplied form field (announcement buttonUrl, or a
+// partner ad's buttonUrl/imageUrl) and gets used client-side without further
 // sanitization.
-function isValidAnnouncementUrl(url: string): boolean {
+function isValidHttpUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     return parsed.protocol === "http:" || parsed.protocol === "https:";
   } catch {
     return false;
   }
+}
+
+// Partner ad color fields (backgroundColor/textColor/buttonBackgroundColor/
+// buttonTextColor) are admin-supplied and rendered straight into a React
+// inline `style` object (see PartnerCard.tsx) — React sets those through
+// CSSOM property setters rather than string-concatenating HTML, so there's
+// no injection risk either way, but this still keeps garbage input from
+// silently breaking the card's styling. Permissive enough for hex
+// (#rgb/#rrggbb/#rrggbbaa), rgb()/rgba()/hsl()/hsla(), and named colors.
+const CSS_COLOR_RE = /^[a-zA-Z0-9#(),.%\s-]{1,40}$/;
+function isValidCssColor(value: string): boolean {
+  return CSS_COLOR_RE.test(value);
 }
 
 type ParsedAnnouncementFields = Omit<Announcement, "id" | "version">;
@@ -351,7 +506,7 @@ function parseAnnouncementBody(
   body: Record<string, unknown>
 ): ParsedAnnouncementFields | { error: string } {
   const text = typeof body.text === "string" ? body.text.trim().slice(0, ANNOUNCEMENT_TEXT_MAX_LEN) : "";
-  if (!isValidAnnouncementField(text, ANNOUNCEMENT_TEXT_MAX_LEN)) {
+  if (!isValidShortText(text, ANNOUNCEMENT_TEXT_MAX_LEN)) {
     return { error: "Texto inválido." };
   }
   const color = typeof body.color === "string" ? body.color : "";
@@ -391,7 +546,7 @@ function parseAnnouncementBody(
     typeof body.buttonLabel === "string"
       ? body.buttonLabel.trim().slice(0, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)
       : "";
-  if (!isValidAnnouncementField(buttonLabel, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)) {
+  if (!isValidShortText(buttonLabel, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)) {
     return { error: "Label do botão inválido." };
   }
   const buttonAction = typeof body.buttonAction === "string" ? body.buttonAction : "";
@@ -400,7 +555,7 @@ function parseAnnouncementBody(
   }
   const needsUrl = buttonAction !== "reload";
   const rawUrl = typeof body.buttonUrl === "string" ? body.buttonUrl.trim() : "";
-  if (needsUrl && !isValidAnnouncementUrl(rawUrl)) {
+  if (needsUrl && !isValidHttpUrl(rawUrl)) {
     return { error: "Link inválido — use uma URL http(s) completa." };
   }
 
@@ -415,6 +570,74 @@ function parseAnnouncementBody(
     visibility: visibility as AnnouncementVisibility,
     sound: sound as AnnouncementSound,
     persistent,
+  };
+}
+
+type ParsedPartnerFields = Omit<Partner, "id" | "createdAt">;
+const PARTNER_WEIGHT_MIN = 1;
+const PARTNER_WEIGHT_MAX = 100;
+const PARTNER_COLOR_FIELDS = [
+  "backgroundColor",
+  "textColor",
+  "buttonBackgroundColor",
+  "buttonTextColor",
+] as const;
+
+// Shared body-parsing/validation for POST (create) and PUT (edit) of a
+// single partner ad — mirrors parseAnnouncementBody's shape/reasoning above.
+function parsePartnerBody(body: Record<string, unknown>): ParsedPartnerFields | { error: string } {
+  const title = typeof body.title === "string" ? body.title.trim().slice(0, PARTNER_TITLE_MAX_LEN) : "";
+  if (!isValidShortText(title, PARTNER_TITLE_MAX_LEN)) {
+    return { error: "Título inválido." };
+  }
+  const description =
+    typeof body.description === "string" ? body.description.trim().slice(0, PARTNER_DESCRIPTION_MAX_LEN) : "";
+  if (!isValidShortText(description, PARTNER_DESCRIPTION_MAX_LEN)) {
+    return { error: "Descrição inválida." };
+  }
+  const buttonLabel =
+    typeof body.buttonLabel === "string" ? body.buttonLabel.trim().slice(0, PARTNER_BUTTON_LABEL_MAX_LEN) : "";
+  if (!isValidShortText(buttonLabel, PARTNER_BUTTON_LABEL_MAX_LEN)) {
+    return { error: "Label do botão inválido." };
+  }
+  const buttonUrl = typeof body.buttonUrl === "string" ? body.buttonUrl.trim() : "";
+  if (!isValidHttpUrl(buttonUrl)) {
+    return { error: "Link do botão inválido — use uma URL http(s) completa." };
+  }
+  const rawImageUrl = typeof body.imageUrl === "string" ? body.imageUrl.trim() : "";
+  if (rawImageUrl && !isValidHttpUrl(rawImageUrl)) {
+    return { error: "URL da imagem inválida — use uma URL http(s) completa." };
+  }
+
+  const colors: Record<(typeof PARTNER_COLOR_FIELDS)[number], string | null> = {
+    backgroundColor: null,
+    textColor: null,
+    buttonBackgroundColor: null,
+    buttonTextColor: null,
+  };
+  for (const field of PARTNER_COLOR_FIELDS) {
+    const value = body[field];
+    const raw = typeof value === "string" ? value.trim() : "";
+    if (raw && !isValidCssColor(raw)) {
+      return { error: "Cor inválida." };
+    }
+    colors[field] = raw || null;
+  }
+
+  const rawWeight = typeof body.weight === "number" && Number.isFinite(body.weight) ? Math.round(body.weight) : 1;
+  const weight = Math.min(PARTNER_WEIGHT_MAX, Math.max(PARTNER_WEIGHT_MIN, rawWeight));
+  const expiresAt =
+    typeof body.expiresAt === "number" && Number.isFinite(body.expiresAt) ? body.expiresAt : null;
+
+  return {
+    title,
+    description,
+    imageUrl: rawImageUrl || null,
+    buttonLabel,
+    buttonUrl,
+    ...colors,
+    weight,
+    expiresAt,
   };
 }
 
@@ -619,6 +842,9 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
   if (currentAnnouncement) {
     announcementStats = { viewerIds: new Set(), buttonClicks: 0, xClicks: 0 };
   }
+  // Restores the configured partner ads (and the empty-response percentage)
+  // the same way — see partnerStore.ts.
+  partnerConfig = await loadPersistedPartnerConfig();
 
   // Detects and reaps half-dead connections (network dropped without a clean
   // close, e.g. mobile network handoff, sleeping laptop, NAT/proxy silently
@@ -855,6 +1081,109 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     broadcastToAll({ type: "announcement", announcement: null, live: true });
     return reply.code(204).send();
   });
+
+  // Sidebar partner-ad slot (see components/PartnerCard.tsx). Public and
+  // cheap — polled once per page load/reload, same budget as /stats/rooms.
+  // `emptyPercent` (see partnerStore.ts) is rolled *here*, per request, so a
+  // brand new or reloaded page sometimes gets nothing even with partners
+  // active — the live socket push (see broadcastPartnerUpdate) deliberately
+  // never rolls this, only this HTTP path does.
+  app.get("/partner", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
+    const pool = activePartners();
+    const showEmpty = partnerConfig.emptyPercent > 0 && Math.random() * 100 < partnerConfig.emptyPercent;
+    const picked = showEmpty ? null : pickWeightedPartner(pool);
+    return { partner: picked ? publicPartner(picked) : null };
+  });
+
+  // Full partner list + live stats for the admin panel — unlike GET
+  // /partner, includes every partner (even expired/inactive ones — see
+  // Partner.expiresAt's doc comment) and the admin-only weight/createdAt
+  // fields, plus each one's engagement numbers.
+  app.get("/admin/partners", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    return {
+      partners: partnerConfig.partners,
+      emptyPercent: partnerConfig.emptyPercent,
+      stats: Object.fromEntries(partnerConfig.partners.map((p) => [p.id, partnerStatsSummary(p.id)])),
+    };
+  });
+
+  app.post("/admin/partners", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const parsed = parsePartnerBody(body);
+    if ("error" in parsed) {
+      return reply.code(400).send({ error: parsed.error });
+    }
+    const partner: Partner = { id: genId(), createdAt: Date.now(), ...parsed };
+    partnerConfig = { ...partnerConfig, partners: [...partnerConfig.partners, partner] };
+    await savePersistedPartnerConfig(partnerConfig);
+    broadcastPartnerUpdate();
+    return { partner, stats: partnerStatsSummary(partner.id) };
+  });
+
+  app.put("/admin/partners/:id", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const { id } = request.params as { id: string };
+    const existing = partnerConfig.partners.find((p) => p.id === id);
+    if (!existing) {
+      return reply.code(404).send({ error: "Anúncio não encontrado." });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const parsed = parsePartnerBody(body);
+    if ("error" in parsed) {
+      return reply.code(400).send({ error: parsed.error });
+    }
+    const updated: Partner = { ...existing, ...parsed };
+    partnerConfig = {
+      ...partnerConfig,
+      partners: partnerConfig.partners.map((p) => (p.id === id ? updated : p)),
+    };
+    await savePersistedPartnerConfig(partnerConfig);
+    broadcastPartnerUpdate();
+    return { partner: updated, stats: partnerStatsSummary(id) };
+  });
+
+  app.delete("/admin/partners/:id", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const { id } = request.params as { id: string };
+    partnerConfig = { ...partnerConfig, partners: partnerConfig.partners.filter((p) => p.id !== id) };
+    partnerStats.delete(id);
+    await savePersistedPartnerConfig(partnerConfig);
+    broadcastPartnerUpdate();
+    return reply.code(204).send();
+  });
+
+  // The global "show nothing X% of the time" knob (see partnerStore.ts's
+  // PartnerConfig.emptyPercent doc comment) — separate from the per-partner
+  // CRUD above since it's not scoped to any one partner. No live broadcast
+  // needed: it only ever affects the GET /partner roll for a future request,
+  // never anyone already connected.
+  app.put(
+    "/admin/partner-settings",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const rawPercent = typeof body.emptyPercent === "number" ? body.emptyPercent : NaN;
+      if (!Number.isFinite(rawPercent) || rawPercent < 0 || rawPercent > 100) {
+        return reply.code(400).send({ error: "Porcentagem inválida — use um número entre 0 e 100." });
+      }
+      partnerConfig = { ...partnerConfig, emptyPercent: rawPercent };
+      await savePersistedPartnerConfig(partnerConfig);
+      return { emptyPercent: partnerConfig.emptyPercent };
+    }
+  );
 
   // Dashboard overview for the admin panel — aggregate numbers only (no
   // room/peer detail, see /admin/rooms for that), so it's cheap to poll.
@@ -1439,6 +1768,25 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-x-click"))) return;
           announcementStats.xClicks += 1;
+          break;
+        }
+        // Same reasoning as the announcement-* cases above, for the sidebar
+        // partner-ad slot (see components/PartnerCard.tsx) — only recorded
+        // for an id that's still a real partner (expired ones stay in
+        // partnerConfig.partners, see its doc comment, so this still counts
+        // a view/click on one that expired moments ago while it was showing).
+        case "partner-view": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!partnerConfig.partners.some((p) => p.id === id)) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-view"))) return;
+          getPartnerStats(id).viewerIds.add(info.id);
+          break;
+        }
+        case "partner-click": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!partnerConfig.partners.some((p) => p.id === id)) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-click"))) return;
+          getPartnerStats(id).clicks += 1;
           break;
         }
         default:
