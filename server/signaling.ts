@@ -12,9 +12,11 @@ import {
   chatMessagesBlockedTotal,
   autoBansTotal,
   turnstileVerificationsTotal,
+  type LocationStats,
 } from "./metrics.js";
 import { recordViolation } from "./rateLimiter.js";
 import { verifyTurnstileToken, TURNSTILE_ENABLED } from "./turnstile.js";
+import { lookupConnectionLocation, type ConnectionLocation } from "./geoip.js";
 import { signToken, verifyToken, requireAdmin } from "./auth.js";
 import {
   createAccount,
@@ -145,6 +147,14 @@ interface ClientInfo {
   // sent to regular participants — only /admin/rooms exposes it, so a
   // moderator can ban whoever's misbehaving straight from the room list.
   ip: string;
+  // GeoIP-derived approximate location of `ip` (see geoip.ts), resolved
+  // once at connect time — null when it couldn't be placed (private/local
+  // address, unroutable range, etc.). Read by registerStatsProvider's
+  // locations breakdown (see metrics.ts's connectionsByLocationGauge) on
+  // every Prometheus scrape; cached here just to avoid re-doing the lookup
+  // on every single scrape (it's deterministic for a given `ip`, so once is
+  // enough for this connection's whole lifetime).
+  geoLocation: ConnectionLocation | null;
   // Set for a moderator connection opened via "admin-join" (see
   // registerAdminRoutes below). Moderator sockets ride the exact same room
   // machinery as a real participant — they're added to the room's socket
@@ -439,6 +449,20 @@ registerStatsProvider(() => {
     else if (c.guestVerified) identities.guestsWithToken += 1;
     else identities.guestsWithoutToken += 1;
   }
+  // Keyed by "country|lat|lon" purely to dedupe while counting — the actual
+  // label values are read back out of each entry below, not parsed from the
+  // key. Only ever holds entries for locations with a connection *right
+  // now* (see connectionsByLocationGauge's doc comment for why that's the
+  // point of recomputing this fresh on every scrape instead of tracking it
+  // incrementally).
+  const locationCounts = new Map<string, LocationStats>();
+  for (const c of clients.values()) {
+    if (!c.geoLocation) continue;
+    const key = `${c.geoLocation.country}|${c.geoLocation.lat}|${c.geoLocation.lon}`;
+    const entry = locationCounts.get(key);
+    if (entry) entry.count += 1;
+    else locationCounts.set(key, { ...c.geoLocation, count: 1 });
+  }
   return {
     connectedSockets: clients.size,
     registeredPeers: registeredPeers.length,
@@ -449,6 +473,7 @@ registerStatsProvider(() => {
       sharingCount: realSharingCount(info),
       isPrivate: isPrivateRoom(handle),
     })),
+    locations: [...locationCounts.values()],
   };
 });
 
@@ -1360,6 +1385,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       isAlive: true,
       socket,
       ip,
+      geoLocation: lookupConnectionLocation(ip),
       rateLimitKey: genId(),
     };
     clients.set(socket, info);

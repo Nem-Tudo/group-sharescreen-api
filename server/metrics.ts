@@ -29,11 +29,23 @@ export type IdentityStats = {
   guestsWithoutToken: number;
 };
 
+// A count of currently-connected sockets sharing one GeoIP location (see
+// server/geoip.ts) — country plus lat/lon already rounded to ~11km. Entries
+// only ever exist for locations with at least one connection *right now*;
+// see connectionsByLocationGauge below for why that matters.
+export type LocationStats = {
+  country: string;
+  lat: string;
+  lon: string;
+  count: number;
+};
+
 export type SignalingStats = {
   connectedSockets: number;
   registeredPeers: number;
   identities: IdentityStats;
   rooms: RoomStats[];
+  locations: LocationStats[];
 };
 
 const emptyStats: SignalingStats = {
@@ -41,6 +53,7 @@ const emptyStats: SignalingStats = {
   registeredPeers: 0,
   identities: { accounts: 0, guestsWithToken: 0, guestsWithoutToken: 0 },
   rooms: [],
+  locations: [],
 };
 
 // signaling.ts owns the actual connection/room state; it hands us a getter
@@ -250,4 +263,35 @@ export const turnstileVerificationsTotal = new Counter({
   help: "Cloudflare Turnstile token verifications performed on room join, by result",
   labelNames: ["result"],
   registers: [register],
+});
+
+// Current WebSocket connections by approximate client location (GeoIP —
+// see geoip.ts's lookupConnectionLocation) — built for a Grafana Geomap
+// panel in "Coords" mode using the lat/lon labels directly. country is an
+// ISO 3166-1 alpha-2 code, also usable on its own via `sum by (country)`
+// for a country-level breakdown. A connection whose IP couldn't be placed
+// (private/local address, unroutable range, or just missing from the
+// offline database) is never counted here at all — see signaling.ts's "/ws"
+// handler — rather than showing up as a pile of connections at 0,0.
+//
+// Recomputed from scratch on every scrape (via getStats().locations) rather
+// than incremented/decremented as connections open/close: same reasoning as
+// sharescreen_room_people above — a plain inc()/dec()'d labeled Gauge
+// remembers every distinct label combination it has *ever* seen and keeps
+// reporting it (stuck at 0) forever once no one's left there, and unlike a
+// room count, distinct (country, lat, lon) triples only ever accumulate
+// over a long-running process's whole lifetime as visitors come from more
+// and more places — reset() first is what keeps this bounded by "how many
+// locations have someone connected *right now*" instead of "how many ever."
+export const connectionsByLocationGauge = new Gauge({
+  name: "sharescreen_connections_by_location",
+  help: "Current WebSocket connections by approximate GeoIP location (country, and lat/lon rounded to ~11km)",
+  labelNames: ["country", "lat", "lon"],
+  registers: [register],
+  collect() {
+    this.reset();
+    for (const loc of getStats().locations) {
+      this.set({ country: loc.country, lat: loc.lat, lon: loc.lon }, loc.count);
+    }
+  },
 });
