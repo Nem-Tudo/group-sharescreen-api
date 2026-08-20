@@ -10,11 +10,10 @@ import {
   signalsRelayedTotal,
   bannedIpConnectionsRejectedTotal,
   chatMessagesBlockedTotal,
-  wsRateLimitedTotal,
   autoBansTotal,
   turnstileVerificationsTotal,
 } from "./metrics.js";
-import { hitRateLimit, recordViolation } from "./rateLimiter.js";
+import { recordViolation } from "./rateLimiter.js";
 import { verifyTurnstileToken, TURNSTILE_ENABLED } from "./turnstile.js";
 import { signToken, verifyToken, requireAdmin } from "./auth.js";
 import {
@@ -31,6 +30,22 @@ import {
   type ChatMessage,
 } from "./chatStore.js";
 import {
+  loadPersistedAnnouncement,
+  savePersistedAnnouncement,
+  deletePersistedAnnouncement,
+  type Announcement,
+  type AnnouncementButtonAction,
+  type AnnouncementColor,
+  type AnnouncementVisibility,
+  type AnnouncementSound,
+} from "./announcementStore.js";
+import {
+  loadPersistedPartnerConfig,
+  savePersistedPartnerConfig,
+  type Partner,
+  type PartnerConfig,
+} from "./partnerStore.js";
+import {
   isIpBanned,
   isValidIp,
   listBans,
@@ -41,6 +56,15 @@ import {
   findBannedWord,
 } from "./moderationStore.js";
 import { MONGO_ENABLED, isMongoConnected } from "./mongo.js";
+import {
+  wsGlobalLimiter,
+  wsRegisterLimiter,
+  wsJoinLimiter,
+  wsChatLimiter,
+  wsSignalLimiter,
+  wsToggleLimiter,
+  consumeRateLimit,
+} from "./rateLimiter.js";
 
 const HANDLE_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 const CLIENT_ID_RE = /^[a-zA-Z0-9-]{8,64}$/;
@@ -48,19 +72,10 @@ const HEARTBEAT_INTERVAL_MS = 25_000;
 const CHAT_MAX_LEN = 500;
 const ANNOUNCEMENT_TEXT_MAX_LEN = 300;
 const ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN = 40;
+const PARTNER_TITLE_MAX_LEN = 80;
+const PARTNER_DESCRIPTION_MAX_LEN = 400;
+const PARTNER_BUTTON_LABEL_MAX_LEN = 40;
 const BAN_REASON_MAX_LEN = 200;
-// Per-connection WS message rate limits. The two that matter for spam (a
-// bot blasting links into every room it can find) are "chat" and "join" —
-// "register" is limited too since a rename spam-broadcasts to the whole
-// room on every change (see the "register" case's peer-renamed broadcast).
-// Generous enough that no real user should ever notice them: nobody sends
-// >5 chat messages in 8s or joins >6 rooms in 10s by hand.
-const CHAT_RATE_LIMIT = 5;
-const CHAT_RATE_WINDOW_MS = 8_000;
-const JOIN_RATE_LIMIT = 6;
-const JOIN_RATE_WINDOW_MS = 10_000;
-const REGISTER_RATE_LIMIT = 8;
-const REGISTER_RATE_WINDOW_MS = 15_000;
 // How many rate-limit violations (across chat/join/register combined) the
 // same IP can rack up before it's treated as automated abuse rather than one
 // over-eager human and auto-banned the same way an admin doing it by hand
@@ -99,6 +114,25 @@ function isPrivateRoom(room: string): boolean {
   return room.startsWith(PRIVATE_PREFIX);
 }
 
+// A non-updated ("old format") client — and any guest before its very first
+// guest-token round-trip — never presents a token at all, so the only thing
+// it can offer to reclaim a stale connection is the plain clientId it was
+// given (see the "register" handler's existingProtected check below). That
+// bare match is inherently spoofable by anyone who has merely seen that id
+// (it's visible in every room's peer list), which is exactly the attack the
+// token system exists to close — but *only once a session has actually
+// verified a token*. Set this to "false" to close that residual gap
+// entirely: reclaiming an existing session then always requires proving it
+// via a matching account/guest token (see isSameOwner), full stop. The
+// trade-off is that a non-updated client — which will never have such a
+// token to present — loses seamless reconnect: a reload or a rename no
+// longer reclaims its old spot, it just starts over as a new guest each
+// time. Registration itself is never refused either way; this only governs
+// how strictly *reclaiming* an existing one is guarded. Defaults to "true"
+// so existing, non-updated clients keep working exactly as they always
+// have.
+const ALLOW_OLD_CLIENTS_GUEST_SYSTEM = process.env.ALLOW_OLD_CLIENTS_GUEST_SYSTEM !== "false";
+
 interface ClientInfo {
   id: string;
   name: string | null;
@@ -135,36 +169,103 @@ interface ClientInfo {
   // always starts unverified, since that's exactly the moment a bot would
   // use to open a fresh connection and dodge the check.
   turnstileVerifiedAt?: number;
+  // Every non-account connection gets a guest identity (see "register"
+  // below) — either freshly minted for this connection, or recovered from a
+  // guest token the client already had. `guestVerified` is what separates
+  // the two: true only when `guestId` came from a token this connection
+  // actually presented (proof it's the same guest as before), false when it
+  // was just made up now because nothing was presented. That distinction is
+  // the whole point of isSameOwner below — a freshly-made-up id never
+  // matches anyone else's, guessed or not, so it can't be used to claim
+  // someone else's session.
+  guestId?: string;
+  guestVerified?: boolean;
+  // Stable per-connection key for the message-rate limiters in
+  // rateLimiter.ts — set once at connect time and never touched again.
+  // Deliberately *not* the same as `id`: `id` can be reassigned mid-life
+  // when this connection reclaims a previous session's clientId (see
+  // "register" below), and a rate-limit bucket should stay tied to this one
+  // physical socket regardless of what identity it's currently wearing —
+  // otherwise reclaiming an id would also silently inherit (or hand off)
+  // whatever budget that id's bucket happened to have left.
+  rateLimitKey: string;
 }
 
 interface RoomInfo {
   sockets: Set<WebSocket>;
   createdAt: number;
   messages: ChatMessage[];
+  // Room-scoped display-name reservations — separate from any other room,
+  // so the same name can be used freely in two different rooms at once (see
+  // isSameOwner and the "join"/"register" handlers). Keyed the same way the
+  // old global `namesInUse` map used to be (lowercased name -> holder).
+  names: Map<string, WebSocket>;
 }
 
-type AnnouncementButtonAction = "open-new-tab" | "open-same-tab" | "reload";
-type AnnouncementColor = "green" | "red" | "blue";
+// Whether `challenger` may take over `existing`'s session/room slot — used
+// wherever that has to be told apart from a stranger merely presenting the
+// same display name or a guessed/observed connection id (see the "register"
+// and "join" handlers). Only `challenger`'s side of the proof matters: for
+// an account, its accountId (always proven — it only ever comes from a
+// verified account JWT); for a guest, a *verified* guestId matching
+// `existing`'s (proven by having just presented the exact token that was
+// privately handed to whoever `existing` is — nobody else could produce
+// it). `existing` itself doesn't need to be verified — plenty of live
+// sessions never re-prove themselves after their first connection, and
+// that's fine, since it's `challenger` making the claim here. What must
+// never count is an *unverified* guestId on the challenger's side, freshly
+// made up for this connection: unlike a verified one, that proves nothing
+// about who's on the other end.
+function isSameOwner(existing: ClientInfo, challenger: ClientInfo): boolean {
+  if (existing.accountId || challenger.accountId) {
+    return Boolean(challenger.accountId) && existing.accountId === challenger.accountId;
+  }
+  return Boolean(challenger.guestVerified) && existing.guestId === challenger.guestId;
+}
+
+// Announcement/AnnouncementButtonAction/AnnouncementColor/
+// AnnouncementVisibility/AnnouncementSound come from announcementStore.js
+// (imported above) — that's also where the persisted copy lives, so both
+// sides of the load/save round-trip share one type definition.
 const ANNOUNCEMENT_ACTIONS = new Set<AnnouncementButtonAction>([
   "open-new-tab",
   "open-same-tab",
   "reload",
 ]);
 const ANNOUNCEMENT_COLORS = new Set<AnnouncementColor>(["green", "red", "blue"]);
+const ANNOUNCEMENT_VISIBILITIES = new Set<AnnouncementVisibility>(["online-only", "all"]);
+const ANNOUNCEMENT_SOUNDS = new Set<AnnouncementSound>(["always", "live-only", "off"]);
+// Custom admin-chosen announcement id (see POST /admin/announcement) — kept
+// distinct from HANDLE_RE/CLIENT_ID_RE since it's a different namespace, but
+// the same conservative charset.
+const ANNOUNCEMENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
-interface Announcement {
-  id: string;
-  text: string;
-  buttonLabel: string;
-  buttonAction: AnnouncementButtonAction;
-  buttonUrl: string | null;
-  color: AnnouncementColor;
-  dismissible: boolean;
+// Real-time engagement counters for whichever announcement is currently
+// active — intentionally not history: replaced/cleared wholesale alongside
+// currentAnnouncement (see setAnnouncement/clearAnnouncementStats below), so
+// there's exactly one bucket to reason about and nothing to sweep. `viewerIds`
+// dedupes by connection id so one visitor toggling tabs/focus repeatedly
+// can't inflate the view count — a "view" only counts once per connection,
+// the first time its tab is actually visible while the banner is showing
+// (see the "announcement-view" case and AnnouncementBanner.tsx).
+interface AnnouncementStatsEntry {
+  viewerIds: Set<string>;
+  buttonClicks: number;
+  xClicks: number;
+}
+let announcementStats: AnnouncementStatsEntry | null = null;
+
+function announcementStatsSummary() {
+  if (!announcementStats) return null;
+  return {
+    views: announcementStats.viewerIds.size,
+    buttonClicks: announcementStats.buttonClicks,
+    xClicks: announcementStats.xClicks,
+  };
 }
 
 const clients = new Map<WebSocket, ClientInfo>();
 const clientsById = new Map<string, ClientInfo>();
-const namesInUse = new Map<string, WebSocket>();
 const rooms = new Map<string, RoomInfo>();
 // Pending "really delete this now-empty room" timers, keyed by room — see
 // scheduleRoomDeletion.
@@ -182,6 +283,138 @@ const ROOM_DELETION_GRACE_MS = 20_000;
 // while it's up.
 let currentAnnouncement: Announcement | null = null;
 
+// Sidebar partner-ad slot (see components/PartnerCard.tsx) — unlike the
+// announcement banner above, more than one can be active at once (see
+// activePartners/pickWeightedPartner/assignPartnersToConnections below for
+// how one gets chosen for a given request/connection). Loaded from
+// partnerStore.js at startup, just like currentAnnouncement.
+let partnerConfig: PartnerConfig = { partners: [], emptyPercent: 0 };
+
+// Real-time engagement counters per partner ad, keyed by id — mirrors
+// AnnouncementStatsEntry above (same viewerIds-dedupe-by-connection
+// reasoning), but per-partner rather than a single active slot, and kept
+// around for as long as the partner itself exists in partnerConfig.partners
+// (including past its expiresAt — see Partner.expiresAt's doc comment)
+// rather than being wholesale-reset the way announcementStats is.
+interface PartnerStatsEntry {
+  viewerIds: Set<string>;
+  clicks: number;
+}
+const partnerStats = new Map<string, PartnerStatsEntry>();
+
+function getPartnerStats(id: string): PartnerStatsEntry {
+  let entry = partnerStats.get(id);
+  if (!entry) {
+    entry = { viewerIds: new Set(), clicks: 0 };
+    partnerStats.set(id, entry);
+  }
+  return entry;
+}
+
+function partnerStatsSummary(id: string) {
+  const entry = partnerStats.get(id);
+  return { views: entry?.viewerIds.size ?? 0, clicks: entry?.clicks ?? 0 };
+}
+
+// Partners whose expiresAt hasn't passed yet — the only ones eligible for
+// selection (HTTP or socket). An expired partner stays in partnerConfig.partners
+// (see its doc comment) but never shows up here again.
+function activePartners(): Partner[] {
+  const now = Date.now();
+  return partnerConfig.partners.filter((p) => p.expiresAt === null || p.expiresAt > now);
+}
+
+// One weighted-random pick for a single HTTP request — independent per
+// call, so across many requests the split between partners converges to
+// their relative weights (see Partner.weight's doc comment) without needing
+// to know how many other requests are happening concurrently, unlike
+// assignPartnersToConnections below which deals with a fixed, known set of
+// connections all at once.
+function pickWeightedPartner(pool: Partner[]): Partner | null {
+  if (pool.length === 0) return null;
+  const totalWeight = pool.reduce((sum, p) => sum + p.weight, 0);
+  if (totalWeight <= 0) return pool[Math.floor(Math.random() * pool.length)];
+  let roll = Math.random() * totalWeight;
+  for (const p of pool) {
+    roll -= p.weight;
+    if (roll <= 0) return p;
+  }
+  return pool[pool.length - 1]; // floating-point fallback, should be unreachable
+}
+
+// Only the fields a visitor actually needs — weight/createdAt are admin
+// bookkeeping, not part of what gets rendered or sent over the wire to a
+// regular client.
+function publicPartner(p: Partner) {
+  return {
+    id: p.id,
+    title: p.title,
+    description: p.description,
+    imageUrl: p.imageUrl,
+    buttonLabel: p.buttonLabel,
+    buttonUrl: p.buttonUrl,
+    backgroundColor: p.backgroundColor,
+    textColor: p.textColor,
+    buttonBackgroundColor: p.buttonBackgroundColor,
+    buttonTextColor: p.buttonTextColor,
+    expiresAt: p.expiresAt,
+  };
+}
+
+// Splits `count` connections across `pool` proportionally to weight, using
+// the largest-remainder method so the split is exact (not just
+// probabilistically close, the way independent per-request random picks —
+// see pickWeightedPartner — would be for a small connection count) even
+// when count doesn't divide evenly. Order is shuffled afterward so which
+// *specific* connections land on which partner isn't correlated with
+// pool/iteration order every time this runs. Returns an array of length
+// `count`; empty pool returns an all-null array.
+function assignPartnersToConnections(pool: Partner[], count: number): (Partner | null)[] {
+  if (count === 0) return [];
+  if (pool.length === 0) return new Array(count).fill(null);
+  const totalWeight = pool.reduce((sum, p) => sum + p.weight, 0);
+  const shares = pool.map((p) => (totalWeight > 0 ? (p.weight / totalWeight) * count : count / pool.length));
+  const bucketCounts = shares.map((s) => Math.floor(s));
+  let assigned = bucketCounts.reduce((sum, n) => sum + n, 0);
+  const remainders = shares
+    .map((s, i) => ({ i, remainder: s - bucketCounts[i] }))
+    .sort((a, b) => b.remainder - a.remainder);
+  let r = 0;
+  while (assigned < count) {
+    bucketCounts[remainders[r % remainders.length].i] += 1;
+    assigned += 1;
+    r += 1;
+  }
+  const bag: Partner[] = [];
+  pool.forEach((p, i) => {
+    for (let k = 0; k < bucketCounts[i]; k += 1) bag.push(p);
+  });
+  for (let i = bag.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [bag[i], bag[j]] = [bag[j], bag[i]];
+  }
+  return bag;
+}
+
+// Pushes a fresh partner assignment to *every* currently connected socket —
+// called after every admin create/edit/delete so already-open tabs update
+// immediately, without waiting for a reload. Deliberately bypasses
+// partnerConfig.emptyPercent entirely (that only governs the HTTP GET
+// /partner roll for a brand new/reloaded page — see the route below) and
+// deliberately doesn't scope to non-moderator/registered connections the
+// way room broadcasts do, matching broadcastToAll's announcement semantics:
+// any open socket might have a PartnerCard mounted, and one that doesn't
+// simply ignores a message type it has no handler for.
+function broadcastPartnerUpdate() {
+  const pool = activePartners();
+  const sockets = [...clients.keys()];
+  const assignment = assignPartnersToConnections(pool, sockets.length);
+  sockets.forEach((socket, i) => {
+    const partner = assignment[i];
+    send(socket, { type: "partner", partner: partner ? publicPartner(partner) : null });
+  });
+}
+
 // A WebRTC offer/answer/ICE candidate is only useful for a few seconds, but
 // `send()` below silently drops it if the target's socket isn't OPEN right
 // then — which happens constantly on mobile (screen lock, wifi/cell
@@ -198,16 +431,26 @@ const PENDING_SIGNAL_TTL_MS = 15_000;
 const MAX_PENDING_SIGNALS_PER_TARGET = 32;
 const pendingSignals = new Map<string, PendingSignal[]>();
 
-registerStatsProvider(() => ({
-  connectedSockets: clients.size,
-  registeredPeers: [...clients.values()].filter((c) => c.name !== null && !c.isModerator).length,
-  rooms: [...rooms.entries()].map(([handle, info]) => ({
-    handle,
-    peopleCount: realPeopleCount(info),
-    sharingCount: realSharingCount(info),
-    isPrivate: isPrivateRoom(handle),
-  })),
-}));
+registerStatsProvider(() => {
+  const registeredPeers = [...clients.values()].filter((c) => c.name !== null && !c.isModerator);
+  const identities = { accounts: 0, guestsWithToken: 0, guestsWithoutToken: 0 };
+  for (const c of registeredPeers) {
+    if (c.accountId) identities.accounts += 1;
+    else if (c.guestVerified) identities.guestsWithToken += 1;
+    else identities.guestsWithoutToken += 1;
+  }
+  return {
+    connectedSockets: clients.size,
+    registeredPeers: registeredPeers.length,
+    identities,
+    rooms: [...rooms.entries()].map(([handle, info]) => ({
+      handle,
+      peopleCount: realPeopleCount(info),
+      sharingCount: realSharingCount(info),
+      isPrivate: isPrivateRoom(handle),
+    })),
+  };
+});
 
 function isValidDisplayName(name: string): boolean {
   if (name.length < 1 || name.length > 24) return false;
@@ -244,10 +487,11 @@ function isValidGifUrl(url: string): boolean {
   return parsed.protocol === "https:" && parsed.hostname.endsWith(".giphy.com");
 }
 
-// Same control-character guard as isValidDisplayName (no newlines — the
-// banner is meant to be short), parameterized on max length since it's
-// reused for both the announcement text and its button label.
-function isValidAnnouncementField(text: string, maxLen: number): boolean {
+// Same control-character guard as isValidDisplayName (no newlines — these
+// are meant to be short single-line fields), parameterized on max length —
+// reused for the announcement text/button label and the partner ad's
+// title/description/button label.
+function isValidShortText(text: string, maxLen: number): boolean {
   if (text.length < 1 || text.length > maxLen) return false;
   for (let i = 0; i < text.length; i += 1) {
     const code = text.charCodeAt(i);
@@ -257,16 +501,173 @@ function isValidAnnouncementField(text: string, maxLen: number): boolean {
 }
 
 // Restricted to http(s) so a "javascript:" (or other) URL scheme can never
-// reach the button's href/window.open target — this URL comes straight from
-// an admin-supplied form field and gets used client-side without further
+// reach a button's href/window.open target or an <img src> — this comes
+// straight from an admin-supplied form field (announcement buttonUrl, or a
+// partner ad's buttonUrl/imageUrl) and gets used client-side without further
 // sanitization.
-function isValidAnnouncementUrl(url: string): boolean {
+function isValidHttpUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     return parsed.protocol === "http:" || parsed.protocol === "https:";
   } catch {
     return false;
   }
+}
+
+// Partner ad color fields (backgroundColor/textColor/buttonBackgroundColor/
+// buttonTextColor) are admin-supplied and rendered straight into a React
+// inline `style` object (see PartnerCard.tsx) — React sets those through
+// CSSOM property setters rather than string-concatenating HTML, so there's
+// no injection risk either way, but this still keeps garbage input from
+// silently breaking the card's styling. Permissive enough for hex
+// (#rgb/#rrggbb/#rrggbbaa), rgb()/rgba()/hsl()/hsla(), and named colors.
+const CSS_COLOR_RE = /^[a-zA-Z0-9#(),.%\s-]{1,40}$/;
+function isValidCssColor(value: string): boolean {
+  return CSS_COLOR_RE.test(value);
+}
+
+type ParsedAnnouncementFields = Omit<Announcement, "id" | "version">;
+
+// Shared body-parsing/validation for POST (create) and PUT (edit) — both
+// take the exact same editable fields, just differ in what happens to
+// id/version/stats around the result (see the two route handlers below).
+function parseAnnouncementBody(
+  body: Record<string, unknown>
+): ParsedAnnouncementFields | { error: string } {
+  const text = typeof body.text === "string" ? body.text.trim().slice(0, ANNOUNCEMENT_TEXT_MAX_LEN) : "";
+  if (!isValidShortText(text, ANNOUNCEMENT_TEXT_MAX_LEN)) {
+    return { error: "Texto inválido." };
+  }
+  const color = typeof body.color === "string" ? body.color : "";
+  if (!ANNOUNCEMENT_COLORS.has(color as AnnouncementColor)) {
+    return { error: "Cor inválida." };
+  }
+  const visibility = typeof body.visibility === "string" ? body.visibility : "all";
+  if (!ANNOUNCEMENT_VISIBILITIES.has(visibility as AnnouncementVisibility)) {
+    return { error: "Visibilidade inválida." };
+  }
+  const sound = typeof body.sound === "string" ? body.sound : "always";
+  if (!ANNOUNCEMENT_SOUNDS.has(sound as AnnouncementSound)) {
+    return { error: "Opção de som inválida." };
+  }
+  const dismissible = Boolean(body.dismissible);
+  const persistent = Boolean(body.persistent);
+  // Defaults to true (button shown) when omitted, so an old admin client
+  // that's never heard of this field keeps behaving exactly as before.
+  const hasButton = body.hasButton !== false;
+
+  if (!hasButton) {
+    return {
+      text,
+      hasButton: false,
+      buttonLabel: "",
+      buttonAction: "reload",
+      buttonUrl: null,
+      color: color as AnnouncementColor,
+      dismissible,
+      visibility: visibility as AnnouncementVisibility,
+      sound: sound as AnnouncementSound,
+      persistent,
+    };
+  }
+
+  const buttonLabel =
+    typeof body.buttonLabel === "string"
+      ? body.buttonLabel.trim().slice(0, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)
+      : "";
+  if (!isValidShortText(buttonLabel, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)) {
+    return { error: "Label do botão inválido." };
+  }
+  const buttonAction = typeof body.buttonAction === "string" ? body.buttonAction : "";
+  if (!ANNOUNCEMENT_ACTIONS.has(buttonAction as AnnouncementButtonAction)) {
+    return { error: "Ação do botão inválida." };
+  }
+  const needsUrl = buttonAction !== "reload";
+  const rawUrl = typeof body.buttonUrl === "string" ? body.buttonUrl.trim() : "";
+  if (needsUrl && !isValidHttpUrl(rawUrl)) {
+    return { error: "Link inválido — use uma URL http(s) completa." };
+  }
+
+  return {
+    text,
+    hasButton: true,
+    buttonLabel,
+    buttonAction: buttonAction as AnnouncementButtonAction,
+    buttonUrl: needsUrl ? rawUrl : null,
+    color: color as AnnouncementColor,
+    dismissible,
+    visibility: visibility as AnnouncementVisibility,
+    sound: sound as AnnouncementSound,
+    persistent,
+  };
+}
+
+type ParsedPartnerFields = Omit<Partner, "id" | "createdAt">;
+const PARTNER_WEIGHT_MIN = 1;
+const PARTNER_WEIGHT_MAX = 100;
+const PARTNER_COLOR_FIELDS = [
+  "backgroundColor",
+  "textColor",
+  "buttonBackgroundColor",
+  "buttonTextColor",
+] as const;
+
+// Shared body-parsing/validation for POST (create) and PUT (edit) of a
+// single partner ad — mirrors parseAnnouncementBody's shape/reasoning above.
+function parsePartnerBody(body: Record<string, unknown>): ParsedPartnerFields | { error: string } {
+  const title = typeof body.title === "string" ? body.title.trim().slice(0, PARTNER_TITLE_MAX_LEN) : "";
+  if (!isValidShortText(title, PARTNER_TITLE_MAX_LEN)) {
+    return { error: "Título inválido." };
+  }
+  const description =
+    typeof body.description === "string" ? body.description.trim().slice(0, PARTNER_DESCRIPTION_MAX_LEN) : "";
+  if (!isValidShortText(description, PARTNER_DESCRIPTION_MAX_LEN)) {
+    return { error: "Descrição inválida." };
+  }
+  const buttonLabel =
+    typeof body.buttonLabel === "string" ? body.buttonLabel.trim().slice(0, PARTNER_BUTTON_LABEL_MAX_LEN) : "";
+  if (!isValidShortText(buttonLabel, PARTNER_BUTTON_LABEL_MAX_LEN)) {
+    return { error: "Label do botão inválido." };
+  }
+  const buttonUrl = typeof body.buttonUrl === "string" ? body.buttonUrl.trim() : "";
+  if (!isValidHttpUrl(buttonUrl)) {
+    return { error: "Link do botão inválido — use uma URL http(s) completa." };
+  }
+  const rawImageUrl = typeof body.imageUrl === "string" ? body.imageUrl.trim() : "";
+  if (rawImageUrl && !isValidHttpUrl(rawImageUrl)) {
+    return { error: "URL da imagem inválida — use uma URL http(s) completa." };
+  }
+
+  const colors: Record<(typeof PARTNER_COLOR_FIELDS)[number], string | null> = {
+    backgroundColor: null,
+    textColor: null,
+    buttonBackgroundColor: null,
+    buttonTextColor: null,
+  };
+  for (const field of PARTNER_COLOR_FIELDS) {
+    const value = body[field];
+    const raw = typeof value === "string" ? value.trim() : "";
+    if (raw && !isValidCssColor(raw)) {
+      return { error: "Cor inválida." };
+    }
+    colors[field] = raw || null;
+  }
+
+  const rawWeight = typeof body.weight === "number" && Number.isFinite(body.weight) ? Math.round(body.weight) : 1;
+  const weight = Math.min(PARTNER_WEIGHT_MAX, Math.max(PARTNER_WEIGHT_MIN, rawWeight));
+  const expiresAt =
+    typeof body.expiresAt === "number" && Number.isFinite(body.expiresAt) ? body.expiresAt : null;
+
+  return {
+    title,
+    description,
+    imageUrl: rawImageUrl || null,
+    buttonLabel,
+    buttonUrl,
+    ...colors,
+    weight,
+    expiresAt,
+  };
 }
 
 function send(socket: WebSocket, msg: unknown) {
@@ -332,6 +733,9 @@ function peerSummary(info: ClientInfo) {
     name: info.name,
     sharing: info.sharing,
     mic: info.mic,
+    // Not logged into a registered account — the client renders this as a
+    // "(guest)" suffix wherever the name is shown (see lib/displayName.ts).
+    isGuest: !info.accountId,
     ...(info.isModerator ? { role: "moderator" as const } : {}),
   };
 }
@@ -392,6 +796,9 @@ function leaveRoom(info: ClientInfo) {
   const roomInfo = rooms.get(room);
   if (roomInfo) {
     roomInfo.sockets.delete(info.socket);
+    if (info.name && roomInfo.names.get(info.name.toLowerCase()) === info.socket) {
+      roomInfo.names.delete(info.name.toLowerCase());
+    }
     if (roomInfo.sockets.size === 0) {
       // The room *looks* empty, but don't wipe its chat history yet — see
       // scheduleRoomDeletion. (A same-identity reconnect that briefly
@@ -427,6 +834,9 @@ function detachSession(info: ClientInfo) {
     const roomInfo = rooms.get(info.room);
     if (roomInfo) {
       roomInfo.sockets.delete(info.socket);
+      if (info.name && roomInfo.names.get(info.name.toLowerCase()) === info.socket) {
+        roomInfo.names.delete(info.name.toLowerCase());
+      }
       // Deliberately leaves the persisted chat file alone even if this was
       // the room's last socket: the new connection taking over this
       // identity is about to "join" the same room again, and will reload
@@ -434,9 +844,6 @@ function detachSession(info: ClientInfo) {
       if (roomInfo.sockets.size === 0) rooms.delete(info.room);
     }
     info.room = null;
-  }
-  if (info.name && namesInUse.get(info.name.toLowerCase()) === info.socket) {
-    namesInUse.delete(info.name.toLowerCase());
   }
   if (clientsById.get(info.id) === info) clientsById.delete(info.id);
   clients.delete(info.socket);
@@ -457,41 +864,41 @@ function disconnectClientsByIp(ip: string) {
   }
 }
 
-// Enforces a per-connection rate limit for one message kind. Returns true if
-// the action is allowed to proceed. On a rejection it tells the sender (so a
-// legitimate client backs off instead of silently retrying forever) and
-// counts it as a violation for that IP — if the same IP crosses
-// AUTO_BAN_VIOLATION_LIMIT violations within AUTO_BAN_VIOLATION_WINDOW_MS,
-// it's auto-banned exactly like an admin ban (persisted, disconnects every
-// socket from that IP immediately). Fire-and-forget on the ban itself since
-// this runs on the hot message-handling path.
-function enforceRateLimit(
-  info: ClientInfo,
-  kind: "chat" | "join" | "register",
-  limit: number,
-  windowMs: number
-): boolean {
-  if (hitRateLimit(`${kind}:${info.id}`, limit, windowMs)) return true;
-  wsRateLimitedTotal.inc({ kind });
-  send(info.socket, {
-    type: "rate-limited",
-    kind,
-    message: "Você está enviando muito rápido. Aguarde um instante.",
-  });
-  if (recordViolation(info.ip, AUTO_BAN_VIOLATION_LIMIT, AUTO_BAN_VIOLATION_WINDOW_MS)) {
-    autoBansTotal.inc();
-    void banIp(
-      info.ip,
-      "Bloqueio automático: excesso de mensagens (possível bot de spam)",
-      AUTO_BAN_DURATION_MINUTES
-    )
-      .then(() => disconnectClientsByIp(info.ip))
-      .catch(() => {});
-  }
-  return false;
+// Tracks rate-limit *violations* (not hits — those are already counted by
+// consumeRateLimit/wsRateLimitedTotal in rateLimiter.ts) for the categories
+// that actually indicate spam (chat/join/register — as opposed to
+// signal/toggle bursts, which are normal WebRTC/UI behavior and dropped
+// silently by design). If the same IP crosses AUTO_BAN_VIOLATION_LIMIT
+// violations within AUTO_BAN_VIOLATION_WINDOW_MS, it's auto-banned exactly
+// like an admin ban (persisted, disconnects every socket from that IP
+// immediately). Fire-and-forget on the ban itself since this runs on the hot
+// message-handling path.
+function recordRateLimitViolation(info: ClientInfo) {
+  if (!recordViolation(info.ip, AUTO_BAN_VIOLATION_LIMIT, AUTO_BAN_VIOLATION_WINDOW_MS)) return;
+  autoBansTotal.inc();
+  void banIp(
+    info.ip,
+    "Bloqueio automático: excesso de mensagens (possível bot de spam)",
+    AUTO_BAN_DURATION_MINUTES
+  )
+    .then(() => disconnectClientsByIp(info.ip))
+    .catch(() => {});
 }
 
-export function registerSignalingRoutes(app: FastifyInstance, genId: () => string) {
+export async function registerSignalingRoutes(app: FastifyInstance, genId: () => string) {
+  // Restores whatever topwarn was active before this process last
+  // restarted (deploy, crash) — see announcementStore.ts. Awaited before any
+  // route/the "/ws" handler below is registered so the very first request
+  // this process serves already sees it, same as initModerationStore/
+  // initAccountStore in index.ts.
+  currentAnnouncement = await loadPersistedAnnouncement();
+  if (currentAnnouncement) {
+    announcementStats = { viewerIds: new Set(), buttonClicks: 0, xClicks: 0 };
+  }
+  // Restores the configured partner ads (and the empty-response percentage)
+  // the same way — see partnerStore.ts.
+  partnerConfig = await loadPersistedPartnerConfig();
+
   // Detects and reaps half-dead connections (network dropped without a clean
   // close, e.g. mobile network handoff, sleeping laptop, NAT/proxy silently
   // dropping an idle socket). Without this, a client can vanish for other
@@ -526,7 +933,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // rooms — but only ever returns a single aggregate number, never handles
   // or peer detail, so it can't be used to discover a private room's
   // existence the way /admin/rooms can.
-  app.get("/stats", async () => {
+  //
+  // Public and cheap, and realistically polled by every open tab's UI
+  // (people-online widget) — generous limit, well above what one real
+  // visitor's polling loop needs, tuned against a scripted hammering loop
+  // instead.
+  app.get("/stats", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
     let peopleOnline = 0;
     for (const info of rooms.values()) peopleOnline += realPeopleCount(info);
     return { peopleOnline };
@@ -535,7 +947,10 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // Public room directory. Private rooms (handle starts with "priv-") are
   // filtered out here, server-side — the client never receives them, so
   // there's no separate access-control step to forget on the frontend.
-  app.get("/rooms", async () => {
+  //
+  // Same reasoning/limit as /stats: public, cheap, polled by the room
+  // browser UI on a normal cadence.
+  app.get("/rooms", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
     const publicRooms = [...rooms.entries()]
       .filter(([handle]) => !isPrivateRoom(handle))
       .map(([handle, info]) => ({
@@ -552,10 +967,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // adminAuth.ts) — it's just an account whose flags include "ADMIN" (see
   // accountStore.ts's initAccountStore bootstrap), checked identically to
   // every other route below via requireAdmin.
-  // Tighter than the global default (see index.ts) — this is the endpoint a
-  // bot would hammer to farm accounts/reserved names, not something a real
-  // user does more than a couple times a minute.
-  app.post("/auth/register", { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } }, async (request, reply) => {
+  // Account creation — cheap to abuse into a spam/enumeration tool if left
+  // uncapped (each attempt tries a password hash + a uniqueness check), and
+  // nobody legitimately creates more than a couple of accounts per IP in a
+  // sitting, so this stays tight.
+  app.post(
+    "/auth/register",
+    { config: { rateLimit: { max: 5, timeWindow: "15 minutes" } } },
+    async (request, reply) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
     const username = (typeof body.username === "string" ? body.username.trim() : "").toLowerCase();
     const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
@@ -579,9 +998,10 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     }
   });
 
-  // Same reasoning as /auth/register — also blunts credential-stuffing
-  // attempts against real accounts.
-  app.post("/auth/login", { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } }, async (request, reply) => {
+  // Login is the classic brute-force target — capped tighter than most
+  // routes here, but loose enough that someone fat-fingering their own
+  // password a few times in a row doesn't get locked out mid-attempt.
+  app.post("/auth/login", { config: { rateLimit: { max: 10, timeWindow: "5 minutes" } } }, async (request, reply) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
     const username = typeof body.username === "string" ? body.username.trim() : "";
     const password = typeof body.password === "string" ? body.password : "";
@@ -593,7 +1013,9 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return { token, account };
   });
 
-  app.get("/auth/me", async (request, reply) => {
+  // Just a token verify + in-memory lookup, and realistically called on
+  // every page load/focus to confirm the session — generous like /stats.
+  app.get("/auth/me", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     const payload = verifyToken(request.headers.authorization?.startsWith("Bearer ")
       ? request.headers.authorization.slice(7)
       : null);
@@ -606,7 +1028,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // Full room directory for moderators — unlike /rooms, this includes
   // private rooms and per-peer detail, since moderation is the one
   // legitimate reason to need that visibility.
-  app.get("/admin/rooms", async (request, reply) => {
+  // Every /admin/* route below is already gated by requireAdmin, so its
+  // realistic caller set is just the admin panel itself (a handful of
+  // moderators at most) — limits here exist as a backstop against a buggy
+  // polling loop or a leaked token, not against a wide pool of untrusted
+  // callers, so GETs get a generous per-minute budget...
+  app.get("/admin/rooms", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -619,7 +1046,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         peers: [...info.sockets]
           .map((s) => clients.get(s))
           .filter((c): c is ClientInfo => c !== undefined && !c.isModerator)
-          .map((c) => ({ id: c.id, name: c.name, sharing: c.sharing, mic: c.mic, ip: c.ip })),
+          .map((c) => ({ id: c.id, name: c.name, sharing: c.sharing, mic: c.mic, ip: c.ip, isGuest: !c.accountId })),
       }))
       .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
     return { rooms: allRooms };
@@ -627,73 +1054,193 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
 
   // Site-wide banner shown to every connected socket (see broadcastToAll),
   // not scoped to a room. GET lets the admin panel show whether one's
-  // already active on load; POST replaces it (and re-broadcasts); DELETE
-  // ends it for everyone currently connected.
-  app.get("/admin/announcement", async (request, reply) => {
+  // already active on load (plus its live engagement stats); POST creates a
+  // brand new one (fresh id + stats, see parseAnnouncementBody/genId below);
+  // PUT edits the currently active one in place (same id, stats preserved,
+  // version bumped — see the Announcement.version doc comment); DELETE ends
+  // it for everyone currently connected.
+  app.get(
+    "/admin/announcement",
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      return { announcement: currentAnnouncement, stats: announcementStatsSummary() };
+    }
+  );
+
+  // ...while mutating admin actions (POST/PUT/DELETE) get a tighter one —
+  // still far above what a human clicking a button ever needs, just enough
+  // to blunt a runaway script.
+  app.post("/admin/announcement", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
-    return { announcement: currentAnnouncement };
-  });
-
-  app.post("/admin/announcement", async (request, reply) => {
-    if (!requireAdmin(request)) {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
-
     const body = (request.body ?? {}) as Record<string, unknown>;
-    const text = typeof body.text === "string" ? body.text.trim().slice(0, ANNOUNCEMENT_TEXT_MAX_LEN) : "";
-    const buttonLabel =
-      typeof body.buttonLabel === "string"
-        ? body.buttonLabel.trim().slice(0, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)
-        : "";
-    const buttonAction = typeof body.buttonAction === "string" ? body.buttonAction : "";
-    const color = typeof body.color === "string" ? body.color : "";
-    const dismissible = Boolean(body.dismissible);
-    const rawUrl = typeof body.buttonUrl === "string" ? body.buttonUrl.trim() : "";
-
-    if (!isValidAnnouncementField(text, ANNOUNCEMENT_TEXT_MAX_LEN)) {
-      return reply.code(400).send({ error: "Texto inválido." });
+    const parsed = parseAnnouncementBody(body);
+    if ("error" in parsed) {
+      return reply.code(400).send({ error: parsed.error });
     }
-    if (!isValidAnnouncementField(buttonLabel, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)) {
-      return reply.code(400).send({ error: "Label do botão inválido." });
-    }
-    if (!ANNOUNCEMENT_ACTIONS.has(buttonAction as AnnouncementButtonAction)) {
-      return reply.code(400).send({ error: "Ação do botão inválida." });
-    }
-    if (!ANNOUNCEMENT_COLORS.has(color as AnnouncementColor)) {
-      return reply.code(400).send({ error: "Cor inválida." });
-    }
-    const needsUrl = buttonAction !== "reload";
-    if (needsUrl && !isValidAnnouncementUrl(rawUrl)) {
-      return reply.code(400).send({ error: "Link inválido — use uma URL http(s) completa." });
+    const rawId = typeof body.id === "string" ? body.id.trim() : "";
+    if (rawId && !ANNOUNCEMENT_ID_RE.test(rawId)) {
+      return reply.code(400).send({ error: "ID inválido — use até 64 letras, números, _ ou -." });
     }
 
-    currentAnnouncement = {
-      id: genId(),
-      text,
-      buttonLabel,
-      buttonAction: buttonAction as AnnouncementButtonAction,
-      buttonUrl: needsUrl ? rawUrl : null,
-      color: color as AnnouncementColor,
-      dismissible,
-    };
-    broadcastToAll({ type: "announcement", announcement: currentAnnouncement });
-    return { announcement: currentAnnouncement };
+    currentAnnouncement = { id: rawId || genId(), version: 1, ...parsed };
+    // A brand new announcement always starts its own fresh counters, even if
+    // it reuses a previous id on purpose — see the AnnouncementStatsEntry
+    // doc comment for why PUT (edit) instead preserves this bucket.
+    announcementStats = { viewerIds: new Set(), buttonClicks: 0, xClicks: 0 };
+    await savePersistedAnnouncement(currentAnnouncement);
+    broadcastToAll({ type: "announcement", announcement: currentAnnouncement, live: true });
+    return { announcement: currentAnnouncement, stats: announcementStatsSummary() };
   });
 
-  app.delete("/admin/announcement", async (request, reply) => {
+  app.put("/admin/announcement", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    if (!currentAnnouncement) {
+      return reply.code(404).send({ error: "Nenhum aviso ativo para editar." });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    // Guards against two admin tabs editing stale state — a client that
+    // fetched the active announcement before someone else replaced it (a
+    // fresh POST, different id) gets told instead of silently overwriting
+    // whatever's live now under a stranger's id.
+    const bodyId = typeof body.id === "string" ? body.id : "";
+    if (bodyId && bodyId !== currentAnnouncement.id) {
+      return reply.code(409).send({ error: "O aviso ativo mudou em outra sessão — recarregue e tente de novo." });
+    }
+    const parsed = parseAnnouncementBody(body);
+    if ("error" in parsed) {
+      return reply.code(400).send({ error: parsed.error });
+    }
+
+    currentAnnouncement = { ...currentAnnouncement, ...parsed, version: currentAnnouncement.version + 1 };
+    await savePersistedAnnouncement(currentAnnouncement);
+    broadcastToAll({ type: "announcement", announcement: currentAnnouncement, live: true });
+    return { announcement: currentAnnouncement, stats: announcementStatsSummary() };
+  });
+
+  app.delete("/admin/announcement", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     currentAnnouncement = null;
-    broadcastToAll({ type: "announcement", announcement: null });
+    announcementStats = null;
+    await deletePersistedAnnouncement();
+    broadcastToAll({ type: "announcement", announcement: null, live: true });
     return reply.code(204).send();
   });
 
+  // Sidebar partner-ad slot (see components/PartnerCard.tsx). Public and
+  // cheap — polled once per page load/reload, same budget as /stats/rooms.
+  // `emptyPercent` (see partnerStore.ts) is rolled *here*, per request, so a
+  // brand new or reloaded page sometimes gets nothing even with partners
+  // active — the live socket push (see broadcastPartnerUpdate) deliberately
+  // never rolls this, only this HTTP path does.
+  app.get("/partner", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
+    const pool = activePartners();
+    const showEmpty = partnerConfig.emptyPercent > 0 && Math.random() * 100 < partnerConfig.emptyPercent;
+    const picked = showEmpty ? null : pickWeightedPartner(pool);
+    return { partner: picked ? publicPartner(picked) : null };
+  });
+
+  // Full partner list + live stats for the admin panel — unlike GET
+  // /partner, includes every partner (even expired/inactive ones — see
+  // Partner.expiresAt's doc comment) and the admin-only weight/createdAt
+  // fields, plus each one's engagement numbers.
+  app.get("/admin/partners", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    return {
+      partners: partnerConfig.partners,
+      emptyPercent: partnerConfig.emptyPercent,
+      stats: Object.fromEntries(partnerConfig.partners.map((p) => [p.id, partnerStatsSummary(p.id)])),
+    };
+  });
+
+  app.post("/admin/partners", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const parsed = parsePartnerBody(body);
+    if ("error" in parsed) {
+      return reply.code(400).send({ error: parsed.error });
+    }
+    const partner: Partner = { id: genId(), createdAt: Date.now(), ...parsed };
+    partnerConfig = { ...partnerConfig, partners: [...partnerConfig.partners, partner] };
+    await savePersistedPartnerConfig(partnerConfig);
+    broadcastPartnerUpdate();
+    return { partner, stats: partnerStatsSummary(partner.id) };
+  });
+
+  app.put("/admin/partners/:id", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const { id } = request.params as { id: string };
+    const existing = partnerConfig.partners.find((p) => p.id === id);
+    if (!existing) {
+      return reply.code(404).send({ error: "Anúncio não encontrado." });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const parsed = parsePartnerBody(body);
+    if ("error" in parsed) {
+      return reply.code(400).send({ error: parsed.error });
+    }
+    const updated: Partner = { ...existing, ...parsed };
+    partnerConfig = {
+      ...partnerConfig,
+      partners: partnerConfig.partners.map((p) => (p.id === id ? updated : p)),
+    };
+    await savePersistedPartnerConfig(partnerConfig);
+    broadcastPartnerUpdate();
+    return { partner: updated, stats: partnerStatsSummary(id) };
+  });
+
+  app.delete("/admin/partners/:id", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const { id } = request.params as { id: string };
+    partnerConfig = { ...partnerConfig, partners: partnerConfig.partners.filter((p) => p.id !== id) };
+    partnerStats.delete(id);
+    await savePersistedPartnerConfig(partnerConfig);
+    broadcastPartnerUpdate();
+    return reply.code(204).send();
+  });
+
+  // The global "show nothing X% of the time" knob (see partnerStore.ts's
+  // PartnerConfig.emptyPercent doc comment) — separate from the per-partner
+  // CRUD above since it's not scoped to any one partner. No live broadcast
+  // needed: it only ever affects the GET /partner roll for a future request,
+  // never anyone already connected.
+  app.put(
+    "/admin/partner-settings",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const rawPercent = typeof body.emptyPercent === "number" ? body.emptyPercent : NaN;
+      if (!Number.isFinite(rawPercent) || rawPercent < 0 || rawPercent > 100) {
+        return reply.code(400).send({ error: "Porcentagem inválida — use um número entre 0 e 100." });
+      }
+      partnerConfig = { ...partnerConfig, emptyPercent: rawPercent };
+      await savePersistedPartnerConfig(partnerConfig);
+      return { emptyPercent: partnerConfig.emptyPercent };
+    }
+  );
+
   // Dashboard overview for the admin panel — aggregate numbers only (no
   // room/peer detail, see /admin/rooms for that), so it's cheap to poll.
-  app.get("/admin/stats", async (request, reply) => {
+  app.get("/admin/stats", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -723,14 +1270,14 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // currently connected from that IP is disconnected right away (see
   // disconnectClientsByIp), and every future "/ws" upgrade from it is
   // rejected before it's ever added to `clients` — see the handler below.
-  app.get("/admin/bans", async (request, reply) => {
+  app.get("/admin/bans", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
     return { bans: listBans() };
   });
 
-  app.post("/admin/bans", async (request, reply) => {
+  app.post("/admin/bans", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -749,7 +1296,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return { ban };
   });
 
-  app.delete("/admin/bans/:ip", async (request, reply) => {
+  app.delete("/admin/bans/:ip", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -761,14 +1308,18 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
   // Chat content filter — one flat list of forbidden words/phrases, replaced
   // wholesale on every PUT (see setBannedWords) rather than incremental
   // add/remove endpoints, matching the shape of a single admin textarea.
-  app.get("/admin/banned-words", async (request, reply) => {
-    if (!requireAdmin(request)) {
-      return reply.code(401).send({ error: "unauthorized" });
+  app.get(
+    "/admin/banned-words",
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      return { words: listBannedWords() };
     }
-    return { words: listBannedWords() };
-  });
+  );
 
-  app.put("/admin/banned-words", async (request, reply) => {
+  app.put("/admin/banned-words", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -780,10 +1331,19 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     return { words };
   });
 
-  // Caps how many new sockets a single IP can open per minute — this is what
-  // stops a bot from just opening a fresh connection every time the
-  // per-message limits below (see enforceRateLimit) catch up to it.
-  app.get("/ws", { websocket: true, config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, (socket: WebSocket, request: FastifyRequest) => {
+  app.get(
+    "/ws",
+    {
+      websocket: true,
+      // Bounds *connection attempts* per IP, not concurrent connections or
+      // anything that happens over an already-open socket (that's the
+      // per-message limiters in rateLimiter.ts, applied inside the message
+      // handler below). 30/min comfortably covers a real client's
+      // reconnect/backoff behavior (network blips, sleep/wake, page
+      // reloads) while still bounding a connection-flood attempt.
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+    },
+    (socket: WebSocket, request: FastifyRequest) => {
     const ip = request.ip;
     if (isIpBanned(ip)) {
       bannedIpConnectionsRejectedTotal.inc();
@@ -800,12 +1360,18 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       isAlive: true,
       socket,
       ip,
+      rateLimitKey: genId(),
     };
     clients.set(socket, info);
     wsConnectionsTotal.inc();
     send(socket, { type: "welcome", id: info.id });
-    if (currentAnnouncement) {
-      send(socket, { type: "announcement", announcement: currentAnnouncement });
+    // "online-only" is deliberately never handed to a connection that shows
+    // up after it was sent — that's the entire distinction from "all" (see
+    // AnnouncementVisibility above). `live: false` tells the client this is
+    // a catch-up delivery, not a fresh one (see AnnouncementBanner.tsx's
+    // sound handling).
+    if (currentAnnouncement && currentAnnouncement.visibility === "all") {
+      send(socket, { type: "announcement", announcement: currentAnnouncement, live: false });
     }
 
     socket.on("pong", () => {
@@ -821,50 +1387,99 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       }
       if (!msg || typeof msg.type !== "string") return;
 
+      // Backstop across every message type combined for this connection —
+      // runs before the per-type limiters below so it also catches a flood
+      // of a `type` no case here recognizes (which the `default: break`
+      // would otherwise process at unlimited rate).
+      if (!(await consumeRateLimit(wsGlobalLimiter, info.rateLimitKey, "global"))) return;
+
       switch (msg.type) {
         case "register": {
-          if (!enforceRateLimit(info, "register", REGISTER_RATE_LIMIT, REGISTER_RATE_WINDOW_MS)) return;
-          const rawName = typeof msg.name === "string" ? msg.name.trim().slice(0, 24) : "";
+          // Covers both the initial registration and every later rename
+          // (renaming doesn't re-enter via "join" — see below), so one
+          // budget for both is enough to stop a rename-spam loop without
+          // getting in the way of a real, occasional name change.
+          if (!(await consumeRateLimit(wsRegisterLimiter, info.rateLimitKey, "register"))) {
+            send(socket, { type: "register-error", message: "Muitas tentativas. Aguarde um instante." });
+            recordRateLimitViolation(info);
+            return;
+          }
+          // A logged-in client passes its account JWT here; a guest passes
+          // whatever guest token a previous "registered" response handed it
+          // (see below) — same `token` field either way, told apart by the
+          // decoded payload's `guest` flag. Neither is required: an old
+          // client that only ever knew about plain names/clientIds sends
+          // nothing here and still works exactly as before.
+          const rawToken = typeof msg.token === "string" ? msg.token : "";
+          const authPayload = rawToken ? verifyToken(rawToken) : null;
+          const isAccountToken = Boolean(authPayload && !authPayload.guest);
+
+          // A logged-in account's display name always comes from its own
+          // account record, never from whatever the client sends alongside
+          // the token — otherwise `name` would be the one piece of identity
+          // info an account holder could still freely spoof despite a valid
+          // token, and it'd let the name drift from what the account
+          // actually shows elsewhere (e.g. the admin panel, chat history
+          // from other rooms). A guest has no such record, so its name
+          // stays exactly what it always was: whatever it types.
+          let rawName: string;
+          if (isAccountToken) {
+            const account = getPublicAccountById(authPayload!.sub);
+            if (!account) {
+              // The account behind this token doesn't exist anymore
+              // (deleted after the token was issued) — treat it like any
+              // other invalid token rather than trusting a name for an
+              // account that's gone.
+              registerErrorsTotal.inc();
+              send(socket, { type: "register-error", message: "Conta não encontrada." });
+              return;
+            }
+            rawName = account.displayName;
+          } else {
+            rawName = typeof msg.name === "string" ? msg.name.trim().slice(0, 24) : "";
+          }
           if (!isValidDisplayName(rawName)) {
             registerErrorsTotal.inc();
             send(socket, { type: "register-error", message: "Nome inválido." });
             return;
           }
 
-          // A client-supplied id (persisted client-side across reloads and
-          // reconnects) lets a returning client reclaim its previous
-          // identity instead of showing up as a stranger to everyone else's
-          // still-open peer connections. If a stale session under that id
-          // is still around (server restart wiped nothing since it's a
-          // fresh process, but a plain reconnect can race the heartbeat
-          // reaper), take it over cleanly first.
-          // A logged-in client passes its JWT here so the rest of this
-          // session (the reserved-name check right below, admin checks,
-          // etc) can trust info.accountId instead of re-verifying a token
-          // on every message.
-          const rawToken = typeof msg.token === "string" ? msg.token : "";
-          const authPayload = rawToken ? verifyToken(rawToken) : null;
-
-          const requestedClientId = typeof msg.clientId === "string" ? msg.clientId : "";
-          const clientId = CLIENT_ID_RE.test(requestedClientId) ? requestedClientId : null;
-          const existingById = clientId ? clientsById.get(clientId) : undefined;
-          if (existingById && existingById.socket !== socket) {
-            detachSession(existingById);
+          let newGuestToken: string | null = null;
+          if (isAccountToken) {
+            info.accountId = authPayload!.sub;
+            info.flags = authPayload!.flags;
+            info.guestId = undefined;
+            info.guestVerified = false;
+          } else {
+            info.accountId = undefined;
+            info.flags = undefined;
+            if (authPayload && authPayload.guest) {
+              info.guestId = authPayload.sub;
+              info.guestVerified = true;
+            } else if (!info.guestId) {
+              // No usable token presented: mint a fresh, unverified guest
+              // identity for this connection and hand back a token for it,
+              // so the client can prove it's still the same guest next time
+              // (see isSameOwner). Every connection that shows up without a
+              // token gets its own distinct id here — that's what stops a
+              // stranger from reusing this guest's publicly-visible name or
+              // connection id to hijack the session below or in "join": they
+              // can never produce a matching *verified* guestId.
+              info.guestId = `guest:${genId()}`;
+              info.guestVerified = false;
+            }
+            if (!info.guestVerified) {
+              newGuestToken = signToken({ sub: info.guestId!, username: rawName, flags: [], guest: true });
+            }
           }
 
           const key = rawName.toLowerCase();
-          const existingByName = namesInUse.get(key);
-          if (existingByName && existingByName !== socket) {
-            registerErrorsTotal.inc();
-            send(socket, { type: "register-error", message: "Esse nome já está em uso." });
-            return;
-          }
           // A name tied to a registered account (its username or display
           // name) is reserved for that account's owner — anyone else, guest
           // or a different account, trying to register under it gets
-          // rejected the same as an already-in-use name above.
+          // rejected.
           const reservedOwnerId = isNameReserved(key);
-          if (reservedOwnerId && reservedOwnerId !== authPayload?.sub) {
+          if (reservedOwnerId && reservedOwnerId !== info.accountId) {
             registerErrorsTotal.inc();
             send(socket, {
               type: "register-error",
@@ -872,16 +1487,63 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             });
             return;
           }
-          const previousName = info.name;
-          if (info.name) namesInUse.delete(info.name.toLowerCase());
-          info.name = rawName;
-          namesInUse.set(key, socket);
-          info.accountId = authPayload?.sub;
-          info.flags = authPayload?.flags;
 
+          // Renaming while already in a room doesn't go through "join"
+          // again, so the room-scoped name collision "join" normally checks
+          // (see below) has to be checked here instead — the same name
+          // could already be held by someone else in *this* room.
+          if (info.room) {
+            const roomInfo = rooms.get(info.room);
+            const holderSocket = roomInfo?.names.get(key);
+            const holder = holderSocket && holderSocket !== socket ? clients.get(holderSocket) : undefined;
+            if (holder && !isSameOwner(holder, info)) {
+              registerErrorsTotal.inc();
+              send(socket, { type: "register-error", message: "Esse nome já está em uso nesta sala." });
+              return;
+            }
+          }
+
+          const previousName = info.name;
+          info.name = rawName;
+          if (info.room) {
+            const roomInfo = rooms.get(info.room);
+            if (roomInfo) {
+              if (previousName) roomInfo.names.delete(previousName.toLowerCase());
+              roomInfo.names.set(key, socket);
+            }
+          }
+
+          // A client-supplied id (persisted client-side across reloads) lets
+          // a returning client reclaim its previous connection id instead of
+          // showing up as a stranger to everyone else's still-open peer
+          // connections. Only actually reclaimed if it's free, already ours,
+          // or provably the same owner as whoever currently holds it —
+          // otherwise someone merely guessing/observing another live
+          // connection's id (it's visible to every peer in its room) could
+          // hijack that session by presenting it back. A session that was
+          // never given a chance to prove itself (no token ever verified for
+          // it — the old, pre-token model) still trusts a bare id match by
+          // default, to keep working exactly as it always has for clients
+          // that don't know about tokens at all — see
+          // ALLOW_OLD_CLIENTS_GUEST_SYSTEM.
+          const requestedClientId = typeof msg.clientId === "string" ? msg.clientId : "";
+          const clientId = CLIENT_ID_RE.test(requestedClientId) ? requestedClientId : null;
           if (clientId && clientId !== info.id) {
-            if (clientsById.get(info.id) === info) clientsById.delete(info.id);
-            info.id = clientId;
+            const existingById = clientsById.get(clientId);
+            if (!existingById) {
+              if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+              info.id = clientId;
+            } else if (existingById.socket !== socket) {
+              const existingProtected =
+                !ALLOW_OLD_CLIENTS_GUEST_SYSTEM || Boolean(existingById.accountId) || existingById.guestVerified;
+              if (!existingProtected || isSameOwner(existingById, info)) {
+                detachSession(existingById);
+                if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+                info.id = clientId;
+              }
+              // else: someone else's protected session — ignore the
+              // requested id and keep our own freshly generated one.
+            }
           }
           clientsById.set(info.id, info);
 
@@ -889,9 +1551,12 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             type: "registered",
             id: info.id,
             name: rawName,
-            account: authPayload
-              ? { username: authPayload.username, flags: authPayload.flags }
-              : null,
+            account: info.accountId ? { username: authPayload!.username, flags: info.flags ?? [] } : null,
+            // Only sent when non-null — a guest whose existing token was
+            // just verified above doesn't need a new one. A client that
+            // doesn't understand this field simply ignores it, same as any
+            // other unrecognized field.
+            guestToken: newGuestToken,
           });
 
           // Renaming while already in a room doesn't go through "join"
@@ -903,7 +1568,13 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           break;
         }
         case "join": {
-          if (!enforceRateLimit(info, "join", JOIN_RATE_LIMIT, JOIN_RATE_WINDOW_MS)) return;
+          // Shared with "admin-join" below — switching rooms is something a
+          // real connection does rarely, never in a tight loop.
+          if (!(await consumeRateLimit(wsJoinLimiter, info.rateLimitKey, "join"))) {
+            send(socket, { type: "join-error", message: "Muitas tentativas. Aguarde um instante." });
+            recordRateLimitViolation(info);
+            return;
+          }
           if (!info.name) {
             send(socket, { type: "error", message: "Registre um nome antes de entrar em uma sala." });
             return;
@@ -946,6 +1617,29 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             if (!clients.has(socket) || info.room === room) return;
           }
 
+          // A name already held by someone else in *this* room is only ever
+          // let through when it's provably the same guest/account already
+          // there under another connection (a second tab, or a reload that
+          // hasn't reclaimed its old connection id yet) — reclaiming just
+          // takes over the slot instead of rejecting, same as a plain
+          // clientId collision does in "register". Two different rooms
+          // never collide this way (this check is scoped to `room` alone),
+          // and a stranger presenting the same name they can see in the
+          // room's peer list is turned away without touching the person
+          // already there.
+          const nameKey = info.name.toLowerCase();
+          const existingRoomInfo = rooms.get(room);
+          const holderSocket = existingRoomInfo?.names.get(nameKey);
+          if (holderSocket && holderSocket !== socket) {
+            const holder = clients.get(holderSocket);
+            if (holder && isSameOwner(holder, info)) {
+              detachSession(holder);
+            } else {
+              send(socket, { type: "join-error", message: "Esse nome já está em uso nesta sala." });
+              return;
+            }
+          }
+
           if (info.room) leaveRoom(info);
           clearRoomDeletionTimer(room);
           info.room = room;
@@ -961,7 +1655,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             const messages = await loadPersistedChat(room);
             roomInfo = rooms.get(room);
             if (!roomInfo) {
-              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages };
+              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages, names: new Map() };
               rooms.set(room, roomInfo);
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
             }
@@ -972,6 +1666,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           // longer trying to join.
           if (info.room !== room || !clients.has(socket)) return;
           roomInfo.sockets.add(socket);
+          roomInfo.names.set(nameKey, socket);
           const peers = [...roomInfo.sockets]
             .filter((s) => s !== socket)
             .map((s) => clients.get(s))
@@ -979,7 +1674,11 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             .map(peerSummary);
           send(socket, { type: "room-state", room, selfId: info.id, peers, messages: roomInfo.messages });
           flushPendingSignals(info);
-          broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name }, socket);
+          broadcastToRoom(
+            room,
+            { type: "peer-joined", id: info.id, name: info.name, isGuest: !info.accountId },
+            socket
+          );
           break;
         }
         // A moderator entering a room to watch/listen for moderation.
@@ -992,6 +1691,10 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         // plain "leave" message (and socket close already calls
         // leaveRoom() regardless), so no separate cleanup path is needed.
         case "admin-join": {
+          if (!(await consumeRateLimit(wsJoinLimiter, info.rateLimitKey, "join"))) {
+            send(socket, { type: "error", message: "Muitas tentativas. Aguarde um instante." });
+            return;
+          }
           const token = typeof msg.token === "string" ? msg.token : "";
           const adminPayload = verifyToken(token);
           if (!adminPayload || !adminPayload.flags.includes("ADMIN")) {
@@ -1030,7 +1733,11 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
             messages: roomInfo.messages,
           });
           flushPendingSignals(info);
-          broadcastToRoom(room, { type: "peer-joined", id: info.id, name: info.name, role: "moderator" }, socket);
+          broadcastToRoom(
+            room,
+            { type: "peer-joined", id: info.id, name: info.name, isGuest: !info.accountId, role: "moderator" },
+            socket
+          );
           break;
         }
         case "leave": {
@@ -1039,19 +1746,36 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         }
         case "sharing": {
           if (!info.room) return;
+          // Dropped silently (no client feedback) when over budget: this is
+          // transient toggle state, not a one-shot user action — the next
+          // real toggle just propagates normally once the window resets.
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
           info.sharing = Boolean(msg.sharing);
           broadcastToRoom(info.room, { type: "peer-sharing", id: info.id, sharing: info.sharing });
           break;
         }
         case "mic": {
           if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
           info.mic = Boolean(msg.mic);
           broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
           break;
         }
         case "chat": {
           if (!info.room) return;
-          if (!enforceRateLimit(info, "chat", CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_MS)) return;
+          // Only rate-limited case besides "register"/"join" that gives the
+          // client explicit feedback — chat is a deliberate, one-off user
+          // action, so silently eating a message (like "signal" below does)
+          // would look like a bug rather than a rate limit; reusing
+          // "chat-blocked" means the frontend already has UI for this.
+          if (!(await consumeRateLimit(wsChatLimiter, info.rateLimitKey, "chat"))) {
+            send(socket, {
+              type: "chat-blocked",
+              message: "Você está enviando mensagens rápido demais. Aguarde um instante.",
+            });
+            recordRateLimitViolation(info);
+            return;
+          }
           const isGif = msg.kind === "gif";
           let chatMessage: ChatMessage;
           if (isGif) {
@@ -1061,6 +1785,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
               id: genId(),
               from: info.id,
               name: info.name as string,
+              isGuest: !info.accountId,
               kind: "gif",
               text: "",
               url,
@@ -1081,6 +1806,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
               id: genId(),
               from: info.id,
               name: info.name as string,
+              isGuest: !info.accountId,
               text,
               ts: Date.now(),
             };
@@ -1097,6 +1823,13 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
         }
         case "signal": {
           if (!info.room) return;
+          // Dropped silently, not surfaced to the client: this limiter is
+          // sized well above what a real mesh negotiation ever needs (see
+          // wsSignalLimiter in rateLimiter.ts), so hitting it means
+          // something is already wrong — no UI message would help, and
+          // WebRTC's own negotiation/retry logic tolerates an occasional
+          // missed signal better than a user-facing error would.
+          if (!(await consumeRateLimit(wsSignalLimiter, info.rateLimitKey, "signal"))) return;
           const targetId = typeof msg.to === "string" ? msg.to : "";
           if (!targetId) return;
           const dataKind =
@@ -1107,6 +1840,52 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
           deliverOrQueueSignal(info.room, targetId, info.id, msg.data);
           break;
         }
+        // Real engagement signals for the admin panel's live announcement
+        // stats (see announcementStats above) — sent by AnnouncementBanner.tsx
+        // only for the announcement it's actually displaying, so a stale/
+        // mismatched id here (an edit or a brand new announcement racing the
+        // client's report) is simply ignored rather than corrupting the
+        // current bucket.
+        case "announcement-view": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-view"))) return;
+          announcementStats.viewerIds.add(info.id);
+          break;
+        }
+        case "announcement-button-click": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-click"))) return;
+          announcementStats.buttonClicks += 1;
+          break;
+        }
+        case "announcement-x-click": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-x-click"))) return;
+          announcementStats.xClicks += 1;
+          break;
+        }
+        // Same reasoning as the announcement-* cases above, for the sidebar
+        // partner-ad slot (see components/PartnerCard.tsx) — only recorded
+        // for an id that's still a real partner (expired ones stay in
+        // partnerConfig.partners, see its doc comment, so this still counts
+        // a view/click on one that expired moments ago while it was showing).
+        case "partner-view": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!partnerConfig.partners.some((p) => p.id === id)) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-view"))) return;
+          getPartnerStats(id).viewerIds.add(info.id);
+          break;
+        }
+        case "partner-click": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!partnerConfig.partners.some((p) => p.id === id)) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-click"))) return;
+          getPartnerStats(id).clicks += 1;
+          break;
+        }
         default:
           break;
       }
@@ -1114,12 +1893,11 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
 
     socket.on("close", () => {
       wsDisconnectionsTotal.inc();
+      // leaveRoom guards its own roomInfo.names cleanup against a
+      // stale/superseded session's delayed close event wiping out a newer
+      // reconnect that already took over this name/id (it only ever deletes
+      // its *own* socket's reservation).
       if (info.room) leaveRoom(info);
-      // Guard against a stale/superseded session's delayed close event
-      // wiping out a newer reconnect that already took over this name/id.
-      if (info.name && namesInUse.get(info.name.toLowerCase()) === socket) {
-        namesInUse.delete(info.name.toLowerCase());
-      }
       if (clientsById.get(info.id) === info) {
         clientsById.delete(info.id);
         pendingSignals.delete(info.id);

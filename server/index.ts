@@ -17,7 +17,7 @@ import websocketPlugin from "@fastify/websocket";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { registerSignalingRoutes } from "./signaling.js";
-import { register as metricsRegister } from "./metrics.js";
+import { register as metricsRegister, httpRateLimitedTotal } from "./metrics.js";
 import { initModerationStore } from "./moderationStore.js";
 import { initAccountStore } from "./accountStore.js";
 
@@ -38,7 +38,7 @@ async function main() {
   // client address from X-Forwarded-For instead of the proxy's own address.
   // Without it every connection would appear to come from the same IP,
   // making IP bans useless.
-  const app = Fastify({ logger: true, trustProxy: true });
+  const app = Fastify({ logger: false, trustProxy: true });
 
   // Loads persisted IP bans and banned words (Mongo if MONGO_URL is set,
   // otherwise a local JSON file — see moderationStore.ts) before the server
@@ -67,40 +67,53 @@ async function main() {
     options: { maxPayload: 64 * 1024 },
   });
 
-  // Per-IP HTTP request limiting. Only ever as strong as request.ip — see
-  // nginx/nginx.conf's X-Forwarded-For rewrite, which is what makes that
-  // value trustworthy in the first place. Global default is deliberately
-  // generous (this also covers /rooms, /stats, etc. getting polled by the
-  // front-end); the actual abuse-prone endpoints (/auth/register,
-  // /auth/login, and the "/ws" upgrade itself) get tighter per-route
-  // overrides where they're registered in signaling.ts.
-  // In-memory store: each replica in the docker-compose rollout enforces its
-  // own counters rather than a shared one (no Redis store wired in), same
-  // trade-off server/rateLimiter.ts makes for WS-message-level limits — a
-  // bot spread across replicas gets N replicas' worth of budget instead of
-  // one, but each replica still caps it instead of it being unbounded.
+  // Global default: applies to every route below unless overridden via that
+  // route's own `config.rateLimit` (see signaling.ts, and the /health and
+  // /metrics overrides right here) — most routes never touch this default
+  // at all, it's just the floor for anything nobody's specifically tuned.
+  // `global: true` (the plugin default) is what makes it apply automatically
+  // to routes registered later, including the ones inside the nested
+  // `registerSignalingRoutes` context below — a root-level onRequest hook
+  // reaches every child context in Fastify's encapsulation model.
   await app.register(rateLimit, {
-    global: true,
-    max: 300,
+    max: 100,
     timeWindow: "1 minute",
+    onExceeded: (request) => {
+      httpRateLimitedTotal.inc({ route: request.routeOptions?.url ?? request.url });
+    },
   });
 
-  app.get("/health", async () => ({ ok: true, CURRENT_ID }));
+  // Health checks (uptime monitors, container orchestrator probes, load
+  // balancers) can legitimately poll every few seconds from a fixed set of
+  // IPs — rate limiting this would risk the check itself flapping the
+  // service as unhealthy, which is worse than any abuse this endpoint could
+  // realistically absorb (it does nothing but echo a constant).
+  app.get("/health", { config: { rateLimit: false } }, async () => ({ ok: true, CURRENT_ID }));
 
-  app.get("/metrics", async (request, reply) => {
-    if (METRICS_TOKEN) {
-      const header = request.headers.authorization || "";
-      const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
-      if (provided !== METRICS_TOKEN) {
-        return reply.code(401).send("Unauthorized");
+  app.get(
+    "/metrics",
+    {
+      // Scraped automatically (Prometheus et al.) on a fixed interval from a
+      // small, known set of scrapers — generous enough to tolerate several
+      // scrape configs hitting it in parallel, but still capped in case this
+      // ever ends up reachable without METRICS_TOKEN set.
+      config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+    },
+    async (request, reply) => {
+      if (METRICS_TOKEN) {
+        const header = request.headers.authorization || "";
+        const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
+        if (provided !== METRICS_TOKEN) {
+          return reply.code(401).send("Unauthorized");
+        }
       }
+      reply.header("Content-Type", metricsRegister.contentType);
+      return metricsRegister.metrics();
     }
-    reply.header("Content-Type", metricsRegister.contentType);
-    return metricsRegister.metrics();
-  });
+  );
 
   await app.register(async (instance) => {
-    registerSignalingRoutes(instance, randomUUID);
+    await registerSignalingRoutes(instance, randomUUID);
   });
 
   try {

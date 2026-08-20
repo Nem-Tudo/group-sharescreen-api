@@ -12,14 +12,36 @@ export type RoomStats = {
   sharingCount: number;
   isPrivate: boolean;
 };
+// A breakdown of registeredPeers by what kind of identity backs them — see
+// server/signaling.ts's ClientInfo (accountId/guestId/guestVerified) and its
+// "register" handler for what each of these actually means:
+//   - accounts: logged into a registered account (a verified account JWT).
+//   - guestsWithToken: a guest whose identity was proven via a guest token
+//     this connection presented (see isSameOwner) — protected against
+//     someone else hijacking their session via a guessed/observed name or
+//     connection id.
+//   - guestsWithoutToken: a guest with no such proof yet — either an old,
+//     non-updated client that doesn't know about guest tokens at all, or a
+//     brand new guest that hasn't had its first token round-trip yet.
+export type IdentityStats = {
+  accounts: number;
+  guestsWithToken: number;
+  guestsWithoutToken: number;
+};
 
 export type SignalingStats = {
   connectedSockets: number;
   registeredPeers: number;
+  identities: IdentityStats;
   rooms: RoomStats[];
 };
 
-const emptyStats: SignalingStats = { connectedSockets: 0, registeredPeers: 0, rooms: [] };
+const emptyStats: SignalingStats = {
+  connectedSockets: 0,
+  registeredPeers: 0,
+  identities: { accounts: 0, guestsWithToken: 0, guestsWithoutToken: 0 },
+  rooms: [],
+};
 
 // signaling.ts owns the actual connection/room state; it hands us a getter
 // once at startup instead of this module importing signaling.ts directly,
@@ -52,6 +74,19 @@ new Gauge({
   registers: [register],
   collect() {
     this.set(getStats().registeredPeers);
+  },
+});
+
+new Gauge({
+  name: "sharescreen_identities",
+  help: "Registered peers broken down by identity kind: a logged-in account, a guest whose token-proven identity protects it from session takeover (see isSameOwner), or a guest with no such proof yet (old client, or not yet through its first token round-trip)",
+  labelNames: ["kind"],
+  registers: [register],
+  collect() {
+    const { identities } = getStats();
+    this.set({ kind: "account" }, identities.accounts);
+    this.set({ kind: "guest_with_token" }, identities.guestsWithToken);
+    this.set({ kind: "guest_without_token" }, identities.guestsWithoutToken);
   },
 });
 
@@ -190,9 +225,16 @@ export const chatMessagesBlockedTotal = new Counter({
   registers: [register],
 });
 
+export const httpRateLimitedTotal = new Counter({
+  name: "sharescreen_http_rate_limited_total",
+  help: "HTTP requests rejected by @fastify/rate-limit (429), by route",
+  labelNames: ["route"],
+  registers: [register],
+});
+
 export const wsRateLimitedTotal = new Counter({
   name: "sharescreen_ws_rate_limited_total",
-  help: "WebSocket messages rejected for exceeding a per-connection rate limit, by action kind",
+  help: "WebSocket messages dropped for exceeding a per-connection rate limit (see rateLimiter.ts), by message category",
   labelNames: ["kind"],
   registers: [register],
 });
