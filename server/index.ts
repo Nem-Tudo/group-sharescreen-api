@@ -38,7 +38,7 @@ async function main() {
   // client address from X-Forwarded-For instead of the proxy's own address.
   // Without it every connection would appear to come from the same IP,
   // making IP bans useless.
-  const app = Fastify({ logger: true, trustProxy: true });
+  const app = Fastify({ logger: false, trustProxy: true });
 
   // Loads persisted IP bans and banned words (Mongo if MONGO_URL is set,
   // otherwise a local JSON file — see moderationStore.ts) before the server
@@ -113,7 +113,7 @@ async function main() {
   );
 
   await app.register(async (instance) => {
-    registerSignalingRoutes(instance, randomUUID);
+    await registerSignalingRoutes(instance, randomUUID);
   });
 
   try {

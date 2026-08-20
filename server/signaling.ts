@@ -26,6 +26,16 @@ import {
   type ChatMessage,
 } from "./chatStore.js";
 import {
+  loadPersistedAnnouncement,
+  savePersistedAnnouncement,
+  deletePersistedAnnouncement,
+  type Announcement,
+  type AnnouncementButtonAction,
+  type AnnouncementColor,
+  type AnnouncementVisibility,
+  type AnnouncementSound,
+} from "./announcementStore.js";
+import {
   isIpBanned,
   isValidIp,
   listBans,
@@ -175,23 +185,45 @@ function isSameOwner(existing: ClientInfo, challenger: ClientInfo): boolean {
   return Boolean(challenger.guestVerified) && existing.guestId === challenger.guestId;
 }
 
-type AnnouncementButtonAction = "open-new-tab" | "open-same-tab" | "reload";
-type AnnouncementColor = "green" | "red" | "blue";
+// Announcement/AnnouncementButtonAction/AnnouncementColor/
+// AnnouncementVisibility/AnnouncementSound come from announcementStore.js
+// (imported above) — that's also where the persisted copy lives, so both
+// sides of the load/save round-trip share one type definition.
 const ANNOUNCEMENT_ACTIONS = new Set<AnnouncementButtonAction>([
   "open-new-tab",
   "open-same-tab",
   "reload",
 ]);
 const ANNOUNCEMENT_COLORS = new Set<AnnouncementColor>(["green", "red", "blue"]);
+const ANNOUNCEMENT_VISIBILITIES = new Set<AnnouncementVisibility>(["online-only", "all"]);
+const ANNOUNCEMENT_SOUNDS = new Set<AnnouncementSound>(["always", "live-only", "off"]);
+// Custom admin-chosen announcement id (see POST /admin/announcement) — kept
+// distinct from HANDLE_RE/CLIENT_ID_RE since it's a different namespace, but
+// the same conservative charset.
+const ANNOUNCEMENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
-interface Announcement {
-  id: string;
-  text: string;
-  buttonLabel: string;
-  buttonAction: AnnouncementButtonAction;
-  buttonUrl: string | null;
-  color: AnnouncementColor;
-  dismissible: boolean;
+// Real-time engagement counters for whichever announcement is currently
+// active — intentionally not history: replaced/cleared wholesale alongside
+// currentAnnouncement (see setAnnouncement/clearAnnouncementStats below), so
+// there's exactly one bucket to reason about and nothing to sweep. `viewerIds`
+// dedupes by connection id so one visitor toggling tabs/focus repeatedly
+// can't inflate the view count — a "view" only counts once per connection,
+// the first time its tab is actually visible while the banner is showing
+// (see the "announcement-view" case and AnnouncementBanner.tsx).
+interface AnnouncementStatsEntry {
+  viewerIds: Set<string>;
+  buttonClicks: number;
+  xClicks: number;
+}
+let announcementStats: AnnouncementStatsEntry | null = null;
+
+function announcementStatsSummary() {
+  if (!announcementStats) return null;
+  return {
+    views: announcementStats.viewerIds.size,
+    buttonClicks: announcementStats.buttonClicks,
+    xClicks: announcementStats.xClicks,
+  };
 }
 
 const clients = new Map<WebSocket, ClientInfo>();
@@ -308,6 +340,82 @@ function isValidAnnouncementUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+type ParsedAnnouncementFields = Omit<Announcement, "id" | "version">;
+
+// Shared body-parsing/validation for POST (create) and PUT (edit) — both
+// take the exact same editable fields, just differ in what happens to
+// id/version/stats around the result (see the two route handlers below).
+function parseAnnouncementBody(
+  body: Record<string, unknown>
+): ParsedAnnouncementFields | { error: string } {
+  const text = typeof body.text === "string" ? body.text.trim().slice(0, ANNOUNCEMENT_TEXT_MAX_LEN) : "";
+  if (!isValidAnnouncementField(text, ANNOUNCEMENT_TEXT_MAX_LEN)) {
+    return { error: "Texto inválido." };
+  }
+  const color = typeof body.color === "string" ? body.color : "";
+  if (!ANNOUNCEMENT_COLORS.has(color as AnnouncementColor)) {
+    return { error: "Cor inválida." };
+  }
+  const visibility = typeof body.visibility === "string" ? body.visibility : "all";
+  if (!ANNOUNCEMENT_VISIBILITIES.has(visibility as AnnouncementVisibility)) {
+    return { error: "Visibilidade inválida." };
+  }
+  const sound = typeof body.sound === "string" ? body.sound : "always";
+  if (!ANNOUNCEMENT_SOUNDS.has(sound as AnnouncementSound)) {
+    return { error: "Opção de som inválida." };
+  }
+  const dismissible = Boolean(body.dismissible);
+  const persistent = Boolean(body.persistent);
+  // Defaults to true (button shown) when omitted, so an old admin client
+  // that's never heard of this field keeps behaving exactly as before.
+  const hasButton = body.hasButton !== false;
+
+  if (!hasButton) {
+    return {
+      text,
+      hasButton: false,
+      buttonLabel: "",
+      buttonAction: "reload",
+      buttonUrl: null,
+      color: color as AnnouncementColor,
+      dismissible,
+      visibility: visibility as AnnouncementVisibility,
+      sound: sound as AnnouncementSound,
+      persistent,
+    };
+  }
+
+  const buttonLabel =
+    typeof body.buttonLabel === "string"
+      ? body.buttonLabel.trim().slice(0, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)
+      : "";
+  if (!isValidAnnouncementField(buttonLabel, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)) {
+    return { error: "Label do botão inválido." };
+  }
+  const buttonAction = typeof body.buttonAction === "string" ? body.buttonAction : "";
+  if (!ANNOUNCEMENT_ACTIONS.has(buttonAction as AnnouncementButtonAction)) {
+    return { error: "Ação do botão inválida." };
+  }
+  const needsUrl = buttonAction !== "reload";
+  const rawUrl = typeof body.buttonUrl === "string" ? body.buttonUrl.trim() : "";
+  if (needsUrl && !isValidAnnouncementUrl(rawUrl)) {
+    return { error: "Link inválido — use uma URL http(s) completa." };
+  }
+
+  return {
+    text,
+    hasButton: true,
+    buttonLabel,
+    buttonAction: buttonAction as AnnouncementButtonAction,
+    buttonUrl: needsUrl ? rawUrl : null,
+    color: color as AnnouncementColor,
+    dismissible,
+    visibility: visibility as AnnouncementVisibility,
+    sound: sound as AnnouncementSound,
+    persistent,
+  };
 }
 
 function send(socket: WebSocket, msg: unknown) {
@@ -501,7 +609,17 @@ function disconnectClientsByIp(ip: string) {
   }
 }
 
-export function registerSignalingRoutes(app: FastifyInstance, genId: () => string) {
+export async function registerSignalingRoutes(app: FastifyInstance, genId: () => string) {
+  // Restores whatever topwarn was active before this process last
+  // restarted (deploy, crash) — see announcementStore.ts. Awaited before any
+  // route/the "/ws" handler below is registered so the very first request
+  // this process serves already sees it, same as initModerationStore/
+  // initAccountStore in index.ts.
+  currentAnnouncement = await loadPersistedAnnouncement();
+  if (currentAnnouncement) {
+    announcementStats = { viewerIds: new Set(), buttonClicks: 0, xClicks: 0 };
+  }
+
   // Detects and reaps half-dead connections (network dropped without a clean
   // close, e.g. mobile network handoff, sleeping laptop, NAT/proxy silently
   // dropping an idle socket). Without this, a client can vanish for other
@@ -657,8 +775,11 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
 
   // Site-wide banner shown to every connected socket (see broadcastToAll),
   // not scoped to a room. GET lets the admin panel show whether one's
-  // already active on load; POST replaces it (and re-broadcasts); DELETE
-  // ends it for everyone currently connected.
+  // already active on load (plus its live engagement stats); POST creates a
+  // brand new one (fresh id + stats, see parseAnnouncementBody/genId below);
+  // PUT edits the currently active one in place (same id, stats preserved,
+  // version bumped — see the Announcement.version doc comment); DELETE ends
+  // it for everyone currently connected.
   app.get(
     "/admin/announcement",
     { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
@@ -666,7 +787,7 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       if (!requireAdmin(request)) {
         return reply.code(401).send({ error: "unauthorized" });
       }
-      return { announcement: currentAnnouncement };
+      return { announcement: currentAnnouncement, stats: announcementStatsSummary() };
     }
   );
 
@@ -677,46 +798,51 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
-
     const body = (request.body ?? {}) as Record<string, unknown>;
-    const text = typeof body.text === "string" ? body.text.trim().slice(0, ANNOUNCEMENT_TEXT_MAX_LEN) : "";
-    const buttonLabel =
-      typeof body.buttonLabel === "string"
-        ? body.buttonLabel.trim().slice(0, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)
-        : "";
-    const buttonAction = typeof body.buttonAction === "string" ? body.buttonAction : "";
-    const color = typeof body.color === "string" ? body.color : "";
-    const dismissible = Boolean(body.dismissible);
-    const rawUrl = typeof body.buttonUrl === "string" ? body.buttonUrl.trim() : "";
-
-    if (!isValidAnnouncementField(text, ANNOUNCEMENT_TEXT_MAX_LEN)) {
-      return reply.code(400).send({ error: "Texto inválido." });
+    const parsed = parseAnnouncementBody(body);
+    if ("error" in parsed) {
+      return reply.code(400).send({ error: parsed.error });
     }
-    if (!isValidAnnouncementField(buttonLabel, ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN)) {
-      return reply.code(400).send({ error: "Label do botão inválido." });
-    }
-    if (!ANNOUNCEMENT_ACTIONS.has(buttonAction as AnnouncementButtonAction)) {
-      return reply.code(400).send({ error: "Ação do botão inválida." });
-    }
-    if (!ANNOUNCEMENT_COLORS.has(color as AnnouncementColor)) {
-      return reply.code(400).send({ error: "Cor inválida." });
-    }
-    const needsUrl = buttonAction !== "reload";
-    if (needsUrl && !isValidAnnouncementUrl(rawUrl)) {
-      return reply.code(400).send({ error: "Link inválido — use uma URL http(s) completa." });
+    const rawId = typeof body.id === "string" ? body.id.trim() : "";
+    if (rawId && !ANNOUNCEMENT_ID_RE.test(rawId)) {
+      return reply.code(400).send({ error: "ID inválido — use até 64 letras, números, _ ou -." });
     }
 
-    currentAnnouncement = {
-      id: genId(),
-      text,
-      buttonLabel,
-      buttonAction: buttonAction as AnnouncementButtonAction,
-      buttonUrl: needsUrl ? rawUrl : null,
-      color: color as AnnouncementColor,
-      dismissible,
-    };
-    broadcastToAll({ type: "announcement", announcement: currentAnnouncement });
-    return { announcement: currentAnnouncement };
+    currentAnnouncement = { id: rawId || genId(), version: 1, ...parsed };
+    // A brand new announcement always starts its own fresh counters, even if
+    // it reuses a previous id on purpose — see the AnnouncementStatsEntry
+    // doc comment for why PUT (edit) instead preserves this bucket.
+    announcementStats = { viewerIds: new Set(), buttonClicks: 0, xClicks: 0 };
+    await savePersistedAnnouncement(currentAnnouncement);
+    broadcastToAll({ type: "announcement", announcement: currentAnnouncement, live: true });
+    return { announcement: currentAnnouncement, stats: announcementStatsSummary() };
+  });
+
+  app.put("/admin/announcement", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    if (!currentAnnouncement) {
+      return reply.code(404).send({ error: "Nenhum aviso ativo para editar." });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    // Guards against two admin tabs editing stale state — a client that
+    // fetched the active announcement before someone else replaced it (a
+    // fresh POST, different id) gets told instead of silently overwriting
+    // whatever's live now under a stranger's id.
+    const bodyId = typeof body.id === "string" ? body.id : "";
+    if (bodyId && bodyId !== currentAnnouncement.id) {
+      return reply.code(409).send({ error: "O aviso ativo mudou em outra sessão — recarregue e tente de novo." });
+    }
+    const parsed = parseAnnouncementBody(body);
+    if ("error" in parsed) {
+      return reply.code(400).send({ error: parsed.error });
+    }
+
+    currentAnnouncement = { ...currentAnnouncement, ...parsed, version: currentAnnouncement.version + 1 };
+    await savePersistedAnnouncement(currentAnnouncement);
+    broadcastToAll({ type: "announcement", announcement: currentAnnouncement, live: true });
+    return { announcement: currentAnnouncement, stats: announcementStatsSummary() };
   });
 
   app.delete("/admin/announcement", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
@@ -724,7 +850,9 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
       return reply.code(401).send({ error: "unauthorized" });
     }
     currentAnnouncement = null;
-    broadcastToAll({ type: "announcement", announcement: null });
+    announcementStats = null;
+    await deletePersistedAnnouncement();
+    broadcastToAll({ type: "announcement", announcement: null, live: true });
     return reply.code(204).send();
   });
 
@@ -855,8 +983,13 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
     clients.set(socket, info);
     wsConnectionsTotal.inc();
     send(socket, { type: "welcome", id: info.id });
-    if (currentAnnouncement) {
-      send(socket, { type: "announcement", announcement: currentAnnouncement });
+    // "online-only" is deliberately never handed to a connection that shows
+    // up after it was sent — that's the entire distinction from "all" (see
+    // AnnouncementVisibility above). `live: false` tells the client this is
+    // a catch-up delivery, not a fresh one (see AnnouncementBanner.tsx's
+    // sound handling).
+    if (currentAnnouncement && currentAnnouncement.visibility === "all") {
+      send(socket, { type: "announcement", announcement: currentAnnouncement, live: false });
     }
 
     socket.on("pong", () => {
@@ -1279,6 +1412,33 @@ export function registerSignalingRoutes(app: FastifyInstance, genId: () => strin
               : "unknown";
           signalsRelayedTotal.inc({ kind: dataKind });
           deliverOrQueueSignal(info.room, targetId, info.id, msg.data);
+          break;
+        }
+        // Real engagement signals for the admin panel's live announcement
+        // stats (see announcementStats above) — sent by AnnouncementBanner.tsx
+        // only for the announcement it's actually displaying, so a stale/
+        // mismatched id here (an edit or a brand new announcement racing the
+        // client's report) is simply ignored rather than corrupting the
+        // current bucket.
+        case "announcement-view": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-view"))) return;
+          announcementStats.viewerIds.add(info.id);
+          break;
+        }
+        case "announcement-button-click": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-click"))) return;
+          announcementStats.buttonClicks += 1;
+          break;
+        }
+        case "announcement-x-click": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-x-click"))) return;
+          announcementStats.xClicks += 1;
           break;
         }
         default:
