@@ -125,3 +125,136 @@ export async function savePersistedPartnerConfig(config: PartnerConfig): Promise
     console.error("[partnerStore] Erro ao salvar anúncios no Redis:", (err as Error).message);
   }
 }
+
+// Accumulated engagement counters for one partner ad. Deliberately plain
+// totals rather than the id-set signaling.ts dedupes views with in memory:
+// that set is keyed by *connection* id, and connections never outlive a
+// restart, so there'd be nothing for a persisted set to dedupe against —
+// only the running process can dedupe its own connections, and what has to
+// survive the restart is the number it already arrived at.
+export interface PartnerStats {
+  views: number;
+  clicks: number;
+}
+
+const PARTNER_STATS_FILE_PATH = path.join(PARTNER_DATA_DIR, "partner-stats.json");
+
+// Mirror of the stats file, so the no-Redis fallback can apply an increment
+// without re-reading the file every time. Null until the first load.
+let diskStats: Record<string, PartnerStats> | null = null;
+
+function normalizeStats(parsed: unknown): Record<string, PartnerStats> {
+  const out: Record<string, PartnerStats> = {};
+  if (!parsed || typeof parsed !== "object") return out;
+  for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const entry = value as Record<string, unknown>;
+    out[id] = {
+      views: typeof entry.views === "number" ? entry.views : 0,
+      clicks: typeof entry.clicks === "number" ? entry.clicks : 0,
+    };
+  }
+  return out;
+}
+
+function loadStatsFromDisk(): Record<string, PartnerStats> {
+  if (diskStats) return diskStats;
+  try {
+    diskStats = normalizeStats(JSON.parse(fs.readFileSync(PARTNER_STATS_FILE_PATH, "utf8")));
+  } catch {
+    diskStats = {};
+  }
+  return diskStats;
+}
+
+function saveStatsToDisk() {
+  try {
+    fs.writeFileSync(PARTNER_STATS_FILE_PATH, JSON.stringify(diskStats ?? {}));
+  } catch {
+    // Best-effort, same as saveToDisk above — the counters still work
+    // in-memory for the life of the process.
+  }
+}
+
+// Separate key from REDIS_KEY (the ad config) on purpose: these change on
+// every single view/click, and a hash lets each one be a HINCRBY on one
+// field instead of rewriting the whole config blob. HINCRBY is also atomic,
+// so several signaling instances sharing this Redis accumulate into the
+// same totals instead of clobbering each other's snapshot.
+const REDIS_STATS_KEY = "sharescreen:partner-stats";
+
+function statsField(id: string, metric: keyof PartnerStats): string {
+  return `${id}:${metric}`;
+}
+
+export async function loadPersistedPartnerStats(): Promise<Record<string, PartnerStats>> {
+  if (!REDIS_URL) return { ...loadStatsFromDisk() };
+  try {
+    const client = await getRedis();
+    const raw: Record<string, string> = (await client.hGetAll(REDIS_STATS_KEY)) ?? {};
+    const out: Record<string, PartnerStats> = {};
+    for (const [field, value] of Object.entries(raw)) {
+      // Field names are `<partnerId>:views` / `<partnerId>:clicks`, and ids
+      // (genId — a UUID) never contain ":", so the last one splits them.
+      const sep = field.lastIndexOf(":");
+      if (sep < 0) continue;
+      const id = field.slice(0, sep);
+      const metric = field.slice(sep + 1);
+      if (metric !== "views" && metric !== "clicks") continue;
+      const entry = out[id] ?? (out[id] = { views: 0, clicks: 0 });
+      entry[metric] = Number(value) || 0;
+    }
+    return out;
+  } catch (err) {
+    console.error("[partnerStore] Erro ao carregar estatísticas do Redis:", (err as Error).message);
+    return {};
+  }
+}
+
+// Adds to whatever's already stored, rather than writing an absolute value:
+// the caller's in-memory number only covers this process's lifetime, so
+// setting it would wipe out everything counted before the last restart (and
+// anything another instance counted in the meantime).
+export async function incrementPersistedPartnerStats(
+  id: string,
+  delta: Partial<PartnerStats>
+): Promise<void> {
+  const views = delta.views ?? 0;
+  const clicks = delta.clicks ?? 0;
+  if (views === 0 && clicks === 0) return;
+  if (!REDIS_URL) {
+    const stats = loadStatsFromDisk();
+    const entry = stats[id] ?? (stats[id] = { views: 0, clicks: 0 });
+    entry.views += views;
+    entry.clicks += clicks;
+    saveStatsToDisk();
+    return;
+  }
+  try {
+    const client = await getRedis();
+    const multi = client.multi();
+    if (views !== 0) multi.hIncrBy(REDIS_STATS_KEY, statsField(id, "views"), views);
+    if (clicks !== 0) multi.hIncrBy(REDIS_STATS_KEY, statsField(id, "clicks"), clicks);
+    await multi.exec();
+  } catch (err) {
+    console.error("[partnerStore] Erro ao salvar estatísticas no Redis:", (err as Error).message);
+  }
+}
+
+// Only called when the ad itself is deleted (see signaling.ts's DELETE
+// /admin/partners/:id) — an expired ad keeps its numbers, same as it keeps
+// its config entry (see Partner.expiresAt).
+export async function deletePersistedPartnerStats(id: string): Promise<void> {
+  if (!REDIS_URL) {
+    const stats = loadStatsFromDisk();
+    delete stats[id];
+    saveStatsToDisk();
+    return;
+  }
+  try {
+    const client = await getRedis();
+    await client.hDel(REDIS_STATS_KEY, [statsField(id, "views"), statsField(id, "clicks")]);
+  } catch (err) {
+    console.error("[partnerStore] Erro ao apagar estatísticas do Redis:", (err as Error).message);
+  }
+}

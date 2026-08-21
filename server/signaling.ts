@@ -44,6 +44,9 @@ import {
 import {
   loadPersistedPartnerConfig,
   savePersistedPartnerConfig,
+  loadPersistedPartnerStats,
+  incrementPersistedPartnerStats,
+  deletePersistedPartnerStats,
   type Partner,
   type PartnerConfig,
 } from "./partnerStore.js";
@@ -300,14 +303,23 @@ let currentAnnouncement: Announcement | null = null;
 // partnerStore.js at startup, just like currentAnnouncement.
 let partnerConfig: PartnerConfig = { partners: [], emptyPercent: 0 };
 
-// Real-time engagement counters per partner ad, keyed by id — mirrors
-// AnnouncementStatsEntry above (same viewerIds-dedupe-by-connection
-// reasoning), but per-partner rather than a single active slot, and kept
-// around for as long as the partner itself exists in partnerConfig.partners
-// (including past its expiresAt — see Partner.expiresAt's doc comment)
-// rather than being wholesale-reset the way announcementStats is.
+// Engagement counters per partner ad, keyed by id — mirrors
+// AnnouncementStatsEntry above (same dedupe-by-connection reasoning), but
+// per-partner rather than a single active slot, and kept around for as long
+// as the partner itself exists in partnerConfig.partners (including past its
+// expiresAt — see Partner.expiresAt's doc comment) rather than being
+// wholesale-reset the way announcementStats is.
+//
+// Unlike announcementStats these are *totals*, hydrated at startup from and
+// written through to partnerStore.js, so a restart (deploy, crash) doesn't
+// zero out an advertiser's numbers mid-campaign. `views` is therefore a
+// running count rather than `viewerIds.size`: the set only dedupes the
+// connections this process has seen since it started (a connection id can't
+// outlive the process that issued it), while the count also carries over
+// everything counted before the last restart — see PartnerStats.
 interface PartnerStatsEntry {
   viewerIds: Set<string>;
+  views: number;
   clicks: number;
 }
 const partnerStats = new Map<string, PartnerStatsEntry>();
@@ -315,7 +327,7 @@ const partnerStats = new Map<string, PartnerStatsEntry>();
 function getPartnerStats(id: string): PartnerStatsEntry {
   let entry = partnerStats.get(id);
   if (!entry) {
-    entry = { viewerIds: new Set(), clicks: 0 };
+    entry = { viewerIds: new Set(), views: 0, clicks: 0 };
     partnerStats.set(id, entry);
   }
   return entry;
@@ -323,7 +335,7 @@ function getPartnerStats(id: string): PartnerStatsEntry {
 
 function partnerStatsSummary(id: string) {
   const entry = partnerStats.get(id);
-  return { views: entry?.viewerIds.size ?? 0, clicks: entry?.clicks ?? 0 };
+  return { views: entry?.views ?? 0, clicks: entry?.clicks ?? 0 };
 }
 
 // Partners whose expiresAt hasn't passed yet — the only ones eligible for
@@ -927,6 +939,18 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
   // Restores the configured partner ads (and the empty-response percentage)
   // the same way — see partnerStore.ts.
   partnerConfig = await loadPersistedPartnerConfig();
+  // ...along with each ad's accumulated views/clicks, so the admin panel
+  // keeps showing an ongoing campaign's real totals instead of restarting
+  // from zero on every deploy. Only ids that still exist in the config are
+  // hydrated — anything else is a leftover with nowhere to be displayed.
+  const persistedPartnerStats = await loadPersistedPartnerStats();
+  for (const partner of partnerConfig.partners) {
+    const persisted = persistedPartnerStats[partner.id];
+    if (!persisted) continue;
+    const entry = getPartnerStats(partner.id);
+    entry.views = persisted.views;
+    entry.clicks = persisted.clicks;
+  }
 
   // Detects and reaps half-dead connections (network dropped without a clean
   // close, e.g. mobile network handoff, sleeping laptop, NAT/proxy silently
@@ -1241,6 +1265,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     const { id } = request.params as { id: string };
     partnerConfig = { ...partnerConfig, partners: partnerConfig.partners.filter((p) => p.id !== id) };
     partnerStats.delete(id);
+    await deletePersistedPartnerStats(id);
     await savePersistedPartnerConfig(partnerConfig);
     broadcastPartnerUpdate();
     return reply.code(204).send();
@@ -1933,7 +1958,17 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const id = typeof msg.id === "string" ? msg.id : "";
           if (!partnerConfig.partners.some((p) => p.id === id)) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-view"))) return;
-          getPartnerStats(id).viewerIds.add(info.id);
+          const entry = getPartnerStats(id);
+          // The dedupe happens before the counter moves, so a repeat view
+          // from the same connection never reaches the persisted total
+          // either — see PartnerStatsEntry.
+          if (entry.viewerIds.has(info.id)) break;
+          entry.viewerIds.add(info.id);
+          entry.views += 1;
+          // Not awaited: it only writes through to Redis/disk (and logs its
+          // own failures), and nothing in this handler's reply depends on
+          // it — no reason to hold up the socket for the roundtrip.
+          void incrementPersistedPartnerStats(id, { views: 1 });
           break;
         }
         case "partner-click": {
@@ -1941,6 +1976,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!partnerConfig.partners.some((p) => p.id === id)) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-click"))) return;
           getPartnerStats(id).clicks += 1;
+          void incrementPersistedPartnerStats(id, { clicks: 1 });
           break;
         }
         default:
