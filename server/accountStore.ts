@@ -190,6 +190,48 @@ export function getPublicAccountById(id: string): PublicAccount | null {
   return account ? toPublicAccount(account) : null;
 }
 
+// Same as getPublicAccountById, but re-reads the document from MongoDB
+// first instead of trusting whatever initAccountStore() cached at boot —
+// accountsById is a startup snapshot, only ever updated afterward by this
+// process's own writes (createAccount/persistAccountUpdate), so a flag
+// (e.g. "VERIFIED") added directly in Mongo — by hand, or by a future admin
+// tool — would otherwise stay invisible until the next restart. Used
+// wherever flags genuinely need to be current: the WS "register" handler
+// (what every peer's badge is decided from) and GET /auth/me (what the
+// owning client itself sees). Also re-indexes the cache with what it finds,
+// so the two stay in sync instead of drifting further apart. Falls back to
+// the plain cached lookup when Mongo isn't configured, *or* when the read
+// itself fails — the caller (WS "register", on every connect/rename) has no
+// try/catch of its own, so a transient Mongo hiccup must degrade to the
+// cached value here rather than reject and take the whole handler down.
+export async function refreshAccountFromMongo(id: string): Promise<PublicAccount | null> {
+  if (!MONGO_ENABLED) return getPublicAccountById(id);
+  let doc: (AccountDoc & { _id: unknown }) | null;
+  try {
+    await connectMongo();
+    doc = (await AccountModel.findOne({ id }).select("+account").lean()) as
+      | (AccountDoc & { _id: unknown })
+      | null;
+  } catch {
+    return getPublicAccountById(id);
+  }
+  if (!doc) {
+    // Deleted out from under the cache — drop it so nothing else here
+    // still treats the id/name as claimed.
+    const existing = accountsById.get(id);
+    if (existing) {
+      accountsById.delete(id);
+      accountsByUsername.delete(fold(existing.username));
+      reservedNames.delete(fold(existing.username));
+      reservedNames.delete(fold(existing.displayName));
+    }
+    return null;
+  }
+  const account = docToFullAccount(doc as unknown as AccountDoc);
+  indexAccount(account);
+  return toPublicAccount(account);
+}
+
 export async function createAccount(
   username: string,
   displayName: string,

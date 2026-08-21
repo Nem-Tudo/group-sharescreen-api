@@ -21,7 +21,7 @@ import { signToken, verifyToken, requireAdmin } from "./auth.js";
 import {
   createAccount,
   verifyAccountLogin,
-  getPublicAccountById,
+  refreshAccountFromMongo,
   isNameReserved,
   USERNAME_RE,
 } from "./accountStore.js";
@@ -1042,14 +1042,16 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     return { token, account };
   });
 
-  // Just a token verify + in-memory lookup, and realistically called on
-  // every page load/focus to confirm the session — generous like /stats.
+  // Token verify + a fresh MongoDB read (not just the boot-time cache), so
+  // a flag change made directly in the database shows up here without
+  // needing a server restart. Realistically called on every page
+  // load/focus to confirm the session — generous like /stats.
   app.get("/auth/me", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     const payload = verifyToken(request.headers.authorization?.startsWith("Bearer ")
       ? request.headers.authorization.slice(7)
       : null);
     if (!payload) return reply.code(401).send({ error: "unauthorized" });
-    const account = getPublicAccountById(payload.sub);
+    const account = await refreshAccountFromMongo(payload.sub);
     if (!account) return reply.code(401).send({ error: "unauthorized" });
     return { account };
   });
@@ -1453,9 +1455,15 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // from other rooms). A guest has no such record, so its name
           // stays exactly what it always was: whatever it types.
           let rawName: string;
+          // Re-fetched from Mongo (not the boot-time cache) and reused below
+          // for info.flags — the JWT's own `flags` claim is a snapshot from
+          // whenever this token was signed, so trusting it here would mean a
+          // flag granted (or revoked) since then never takes effect until
+          // the holder logs in again for a fresh token.
+          let freshAccount: Awaited<ReturnType<typeof refreshAccountFromMongo>> = null;
           if (isAccountToken) {
-            const account = getPublicAccountById(authPayload!.sub);
-            if (!account) {
+            freshAccount = await refreshAccountFromMongo(authPayload!.sub);
+            if (!freshAccount) {
               // The account behind this token doesn't exist anymore
               // (deleted after the token was issued) — treat it like any
               // other invalid token rather than trusting a name for an
@@ -1464,7 +1472,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               send(socket, { type: "register-error", message: "Conta não encontrada." });
               return;
             }
-            rawName = account.displayName;
+            rawName = freshAccount.displayName;
           } else {
             rawName = typeof msg.name === "string" ? msg.name.trim().slice(0, 24) : "";
           }
@@ -1477,7 +1485,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           let newGuestToken: string | null = null;
           if (isAccountToken) {
             info.accountId = authPayload!.sub;
-            info.flags = authPayload!.flags;
+            info.flags = freshAccount!.flags;
             info.guestId = undefined;
             info.guestVerified = false;
           } else {
