@@ -71,11 +71,19 @@ import {
   wsChatLimiter,
   wsSignalLimiter,
   wsToggleLimiter,
+  createRoomLimiter,
   consumeRateLimit,
 } from "./rateLimiter.js";
+import { createApiToken, listApiTokens, revokeApiToken, requireApiToken } from "./apiTokenStore.js";
+import { getRoomReservation, createRoomReservation, deleteRoomReservation } from "./apiRoomStore.js";
 
 const HANDLE_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 const CLIENT_ID_RE = /^[a-zA-Z0-9-]{8,64}$/;
+// Base URL for the public frontend — used to build the shareable link
+// returned by POST /createroom (an external integration gets a full URL
+// back, not just a bare handle). Same sensible-default-overridable-by-env
+// shape as METRICS_TOKEN in index.ts.
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://golive.nemtudo.me";
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const CHAT_MAX_LEN = 500;
 const ANNOUNCEMENT_TEXT_MAX_LEN = 300;
@@ -891,6 +899,35 @@ function leaveRoom(info: ClientInfo) {
   broadcastToRoom(room, { type: "peer-left", id: info.id }, info.socket);
 }
 
+// Used by DELETE /createroom to end a room an external integration owns,
+// even while people are still in it — distinct from BANNED_CLOSE_CODE below
+// (that's about the *person*, not the room), so the client can show "esta
+// sala foi encerrada" instead of a ban message. 4004 is in the same
+// private-use range as SUPERSEDED_CLOSE_CODE/BANNED_CLOSE_CODE.
+const ROOM_CLOSED_CLOSE_CODE = 4004;
+
+// Force-closes a live room: every connected socket gets a "room-closed"
+// message and is closed with ROOM_CLOSED_CLOSE_CODE, and the room record
+// (plus its persisted chat) is deleted immediately — skipping the normal
+// ROOM_DELETION_GRACE_MS reconnect window, since this is an explicit,
+// intentional closure rather than everyone just happening to leave. Deleting
+// `rooms`'s entry before the sockets' own close events land is safe: the
+// existing WS "close" handler's leaveRoom/broadcastToRoom calls already
+// guard on `rooms.get(room)` being present, and clientsById/clients cleanup
+// there doesn't depend on the room existing at all. A no-op if the room was
+// only ever reserved (see apiRoomStore.ts) and never actually joined.
+function closeRoomForcibly(room: string) {
+  const roomInfo = rooms.get(room);
+  if (!roomInfo) return;
+  for (const s of [...roomInfo.sockets]) {
+    send(s, { type: "room-closed", message: "Esta sala foi encerrada." });
+    s.close(ROOM_CLOSED_CLOSE_CODE, "room-closed-by-api");
+  }
+  clearRoomDeletionTimer(room);
+  rooms.delete(room);
+  deletePersistedChat(room);
+}
+
 // Close code used when a second connection reclaims a client id out from
 // under a still-live socket (see detachSession below) — lets the displaced
 // client tell "I was intentionally superseded" apart from an ordinary
@@ -1446,6 +1483,122 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     const words = await setBannedWords(body.words as string[]);
     return { words };
   });
+
+  // API tokens for external system integration — POST/DELETE /createroom
+  // below is the only thing a token can do; unlike an admin JWT it carries
+  // no flags and can't touch any other route. Still admin-only to manage,
+  // same requireAdmin gate as every other /admin/* route in this file.
+  app.get("/admin/tokens", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    return { tokens: await listApiTokens() };
+  });
+
+  app.post("/admin/tokens", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    const admin = requireAdmin(request);
+    if (!admin) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const label = typeof body.label === "string" ? body.label.trim().slice(0, 100) : "";
+    if (!label) {
+      return reply.code(400).send({ error: "Label é obrigatório." });
+    }
+    // The raw token is only ever returned here, at creation — only its
+    // sha256 hash is persisted (see apiTokenStore.ts), so this response is
+    // the caller's one chance to copy it down.
+    const { token, raw } = await createApiToken(label, admin.sub);
+    return reply.code(201).send({ token, rawToken: raw });
+  });
+
+  app.delete(
+    "/admin/tokens/:id",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      const { id } = request.params as { id: string };
+      const revoked = await revokeApiToken(id);
+      if (!revoked) {
+        return reply.code(404).send({ error: "Token não encontrado." });
+      }
+      return reply.code(204).send();
+    }
+  );
+
+  // External room creation/deletion — see apiTokenStore.ts/apiRoomStore.ts.
+  // Reserves/frees a handle only; the room itself only becomes live on the
+  // first real WebSocket join, exactly like an organically-created room.
+  app.post(
+    "/createroom",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      const token = await requireApiToken(request);
+      if (!token) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      if (!(await consumeRateLimit(createRoomLimiter, token.id, "createroom"))) {
+        return reply.code(429).send({ error: "Muitas requisições. Aguarde um instante." });
+      }
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const requestedHandle = typeof body.handle === "string" ? body.handle.trim() : "";
+      let handle: string;
+      if (requestedHandle) {
+        if (!HANDLE_RE.test(requestedHandle)) {
+          return reply.code(400).send({ error: "Handle inválido — use até 32 letras, números, _ ou -." });
+        }
+        if (rooms.has(requestedHandle) || (await getRoomReservation(requestedHandle))) {
+          return reply.code(409).send({ error: "Esse handle já está em uso." });
+        }
+        handle = requestedHandle;
+      } else {
+        // genId() is randomUUID (see the function signature below) — sliced
+        // down to a HANDLE_RE-compatible, URL-friendly chunk. A handful of
+        // retries covers the astronomically unlikely case of a collision.
+        let candidate: string | null = null;
+        for (let attempt = 0; attempt < 5 && !candidate; attempt += 1) {
+          const generated = genId().replace(/-/g, "").slice(0, 12);
+          if (!rooms.has(generated) && !(await getRoomReservation(generated))) candidate = generated;
+        }
+        if (!candidate) {
+          return reply.code(503).send({ error: "Não foi possível gerar um handle único. Tente novamente." });
+        }
+        handle = candidate;
+      }
+      await createRoomReservation(handle, token.id);
+      return reply.code(201).send({ handle, url: `${FRONTEND_URL}/watch/${handle}` });
+    }
+  );
+
+  app.delete(
+    "/createroom",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      const token = await requireApiToken(request);
+      if (!token) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      if (!(await consumeRateLimit(createRoomLimiter, token.id, "createroom"))) {
+        return reply.code(429).send({ error: "Muitas requisições. Aguarde um instante." });
+      }
+      const { handle } = request.query as { handle?: string };
+      if (!handle) {
+        return reply.code(400).send({ error: "Parâmetro 'handle' obrigatório." });
+      }
+      const reservation = await getRoomReservation(handle);
+      if (!reservation) {
+        return reply.code(404).send({ error: "Sala não encontrada." });
+      }
+      if (reservation.tokenId !== token.id) {
+        return reply.code(403).send({ error: "Esta sala pertence a outro token." });
+      }
+      closeRoomForcibly(handle);
+      await deleteRoomReservation(handle);
+      return reply.code(204).send();
+    }
+  );
 
   app.get(
     "/ws",

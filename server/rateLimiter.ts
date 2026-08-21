@@ -122,6 +122,14 @@ export const wsSignalLimiter = new RateLimiterMemory({ points: 1500, duration: 5
 // enough to allow a bit of rapid double-toggling without dropping it.
 export const wsToggleLimiter = new RateLimiterMemory({ points: 20, duration: 10 });
 
+// POST/DELETE /createroom — an external integration's own budget, keyed by
+// token id rather than by connection. A plain HTTP route (not a per-message
+// ws type like everything above), so it's rate-limited here rather than via
+// the ws-specific limiters, but reuses the same consumeRateLimit helper.
+// Shared between both verbs, same "rarely called in a tight loop" reasoning
+// as wsJoinLimiter above.
+export const createRoomLimiter = new RateLimiterMemory({ points: 20, duration: 60 });
+
 // Consumes one point from `limiter` for `key`; returns false (and bumps the
 // `sharescreen_ws_rate_limited_total{kind}` counter) instead of throwing
 // when the budget is exhausted, so call sites can use it as a plain
