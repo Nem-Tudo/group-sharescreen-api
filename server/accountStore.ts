@@ -480,21 +480,41 @@ export async function createOAuthAccount(options: {
 // because a verified email matched it (see oauthRoutes.ts) or because its
 // owner asked to connect it while logged in. Idempotent: linking the same
 // identity twice is a no-op rather than a duplicate entry.
+export type LinkOAuthResult =
+  | { ok: true; account: PublicAccount }
+  // The account the link was for no longer exists (deleted mid-flow).
+  | { ok: false; reason: "account-gone" }
+  // That provider account is already someone else's way into the site.
+  | { ok: false; reason: "identity-taken" };
+
 export async function linkOAuthIdentity(
   accountId: string,
   identity: OAuthIdentityInput,
   emailVerified: boolean
-): Promise<PublicAccount | null> {
+): Promise<LinkOAuthResult> {
   const account = accountsById.get(accountId);
-  if (!account) return null;
+  if (!account) return { ok: false, reason: "account-gone" };
+  // A provider identity resolves to exactly one account here (see
+  // accountsByOAuth), so linking one that already belongs to somebody else
+  // can't mean "move it" — it would silently take over their login while
+  // leaving a dead entry behind on their account. Refuse instead, and let
+  // the caller say so.
+  const owner = findAccountIdByOAuth(identity.provider, identity.providerUserId);
+  if (owner && owner !== accountId) return { ok: false, reason: "identity-taken" };
   const alreadyLinked = account.oauth.some(
     (entry) =>
       entry.provider === identity.provider && entry.providerUserId === identity.providerUserId
   );
   if (!alreadyLinked) {
-    // One account per provider: linking a second Discord replaces the first
-    // rather than leaving two entries that both resolve here, which is what
-    // someone switching their Discord account actually means.
+    // One entry per provider: connecting a *different* Discord account
+    // replaces the previous one rather than leaving two entries on the same
+    // account, which is what switching Discord accounts actually means. The
+    // one being replaced stops resolving here, so drop its index entry too.
+    for (const entry of account.oauth) {
+      if (entry.provider === identity.provider) {
+        accountsByOAuth.delete(oauthIndexKey(entry.provider, entry.providerUserId));
+      }
+    }
     account.oauth = [
       ...account.oauth.filter((entry) => entry.provider !== identity.provider),
       { ...identity, linkedAt: Date.now() },
@@ -510,7 +530,7 @@ export async function linkOAuthIdentity(
     indexAccount(account);
     await persistAccountIdentity(account);
   }
-  return toPublicAccount(account);
+  return { ok: true, account: toPublicAccount(account) };
 }
 
 function findAccountIdByOAuth(provider: string, providerUserId: string): string | undefined {

@@ -246,8 +246,18 @@ export async function registerOAuthRoutes(app: FastifyInstance) {
           { provider, providerUserId: profile.providerUserId, email: profile.email },
           profile.emailVerified
         );
-        if (!linked) return redirectToApp(reply, state, { error: "account_gone" });
-        return redirectToApp(reply, state, { token: sessionTokenFor(linked), linked: provider });
+        if (!linked.ok) {
+          // "identity-taken" is the one a user can actually hit: they
+          // authorized a provider account that's already someone else's way
+          // into the site. Refused rather than moved (see linkOAuthIdentity).
+          return redirectToApp(reply, state, {
+            error: linked.reason === "identity-taken" ? "identity_taken" : "account_gone",
+          });
+        }
+        return redirectToApp(reply, state, {
+          token: sessionTokenFor(linked.account),
+          linked: provider,
+        });
       }
 
       // Case B — an identity we've seen before: a plain login.
@@ -273,8 +283,15 @@ export async function registerOAuthRoutes(app: FastifyInstance) {
             { provider, providerUserId: profile.providerUserId, email: profile.email },
             true
           );
-          if (linked) {
-            return redirectToApp(reply, state, { token: sessionTokenFor(linked), linked: provider });
+          // A failure here falls through to the signup step below rather
+          // than erroring out: "identity-taken" is unreachable (the lookup
+          // just above found no owner for it), and an account that vanished
+          // mid-flow shouldn't block someone from creating a new one.
+          if (linked.ok) {
+            return redirectToApp(reply, state, {
+              token: sessionTokenFor(linked.account),
+              linked: provider,
+            });
           }
         }
       }

@@ -46,9 +46,14 @@ Em dev, os mesmos caminhos com `http://localhost:4000`.
 - **Primeira vez, conta nova:** o usuário escolhe usuário/nome de exibição
   (já pré-preenchidos com o nome do provedor). Nenhuma conta é criada antes
   disso — desistir no meio não deixa lixo no banco.
+- **Já tem conta e quer vincular:** estando logado, o front manda o token da
+  sessão no `/start` e a API prende o provedor **àquela** conta — mesmo id,
+  mesmos flags, mesmo histórico. Se aquela conta do Discord/Google já for o
+  acesso de outro usuário daqui, o vínculo é recusado (`identity_taken`) em
+  vez de mudar de dono.
 
 Contas criadas por login social ficam sem senha, então não entram por
 `/auth/login`. `GET /auth/me` devolve `connections` (`providers` e
-`hasPassword`) para o front saber o que oferecer, e
+`hasPassword`), que é o que alimenta o painel "Conexões" na home, e
 `DELETE /auth/oauth/:provider/link` desvincula um provedor — recusando
 quando é o último jeito de entrar na conta.
