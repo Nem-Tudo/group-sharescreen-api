@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import bcrypt from "bcryptjs";
+import { createClient } from "redis";
 import { MONGO_ENABLED, connectMongo } from "./mongo.js";
 import { AccountModel, type AccountDoc } from "./accountModels.js";
 
@@ -133,6 +134,12 @@ async function persistAccountUpdate(account: FullAccount): Promise<void> {
   } else {
     saveToDisk();
   }
+  // Written here as much as by "flags" (currently the only field this
+  // function ever changes besides ips) — anything this process itself
+  // writes should never be masked by its own Redis cache for up to a
+  // minute. invalidateCachedAccount is defined further down, after the
+  // redis helpers, but hoisting makes this reference valid at call time.
+  void invalidateCachedAccount(account.id);
 }
 
 function indexAccount(account: FullAccount) {
@@ -190,21 +197,99 @@ export function getPublicAccountById(id: string): PublicAccount | null {
   return account ? toPublicAccount(account) : null;
 }
 
-// Same as getPublicAccountById, but re-reads the document from MongoDB
-// first instead of trusting whatever initAccountStore() cached at boot —
-// accountsById is a startup snapshot, only ever updated afterward by this
-// process's own writes (createAccount/persistAccountUpdate), so a flag
-// (e.g. "VERIFIED") added directly in Mongo — by hand, or by a future admin
-// tool — would otherwise stay invisible until the next restart. Used
-// wherever flags genuinely need to be current: the WS "register" handler
-// (what every peer's badge is decided from) and GET /auth/me (what the
-// owning client itself sees). Also re-indexes the cache with what it finds,
-// so the two stay in sync instead of drifting further apart. Falls back to
-// the plain cached lookup when Mongo isn't configured, *or* when the read
-// itself fails — the caller (WS "register", on every connect/rename) has no
-// try/catch of its own, so a transient Mongo hiccup must degrade to the
-// cached value here rather than reject and take the whole handler down.
+// Redis is opt-in: only used when REDIS_URL is set (same shape as
+// chatStore.ts/announcementStore.ts/partnerStore.ts). Sits in front of the
+// MongoDB read below — a 60s TTL cache, not a source of truth, so any
+// failure here just falls through to Mongo instead of blocking anything.
+const REDIS_URL = process.env.REDIS_URL;
+// `any` for the same reason as chatStore.ts's RedisClient alias — see its
+// doc comment.
+type RedisClient = any; // eslint-disable-line @typescript-eslint/no-explicit-any
+let redisReady: Promise<RedisClient> | null = null;
+
+async function getRedis(): Promise<RedisClient> {
+  if (redisReady) return redisReady;
+  const client = createClient({ url: REDIS_URL });
+  client.on("error", (err: Error) => {
+    console.error("[accountStore] Erro na conexão com o Redis:", err.message);
+  });
+  const connecting = client.connect().then(() => client);
+  redisReady = connecting;
+  try {
+    return await connecting;
+  } catch (err) {
+    redisReady = null;
+    throw err;
+  }
+}
+
+function redisAccountKey(id: string): string {
+  return `sharescreen:account:${id}`;
+}
+
+// 60s: refreshAccountFromMongo exists specifically so a flag change made
+// directly in the database (no admin-panel write path for it yet) shows up
+// without a server restart — this is the cap on how long that can now take
+// to actually reach a client, in exchange for not hitting Mongo on every
+// single WS "register" and /auth/me poll.
+const ACCOUNT_CACHE_TTL_SECONDS = 60;
+
+async function getCachedAccount(id: string): Promise<PublicAccount | null> {
+  if (!REDIS_URL) return null;
+  try {
+    const client = await getRedis();
+    const raw: string | null = await client.get(redisAccountKey(id));
+    return raw ? (JSON.parse(raw) as PublicAccount) : null;
+  } catch (err) {
+    console.error("[accountStore] Erro ao ler cache de conta no Redis:", (err as Error).message);
+    return null;
+  }
+}
+
+async function setCachedAccount(account: PublicAccount): Promise<void> {
+  if (!REDIS_URL) return;
+  try {
+    const client = await getRedis();
+    await client.set(redisAccountKey(account.id), JSON.stringify(account), {
+      EX: ACCOUNT_CACHE_TTL_SECONDS,
+    });
+  } catch (err) {
+    console.error("[accountStore] Erro ao salvar cache de conta no Redis:", (err as Error).message);
+  }
+}
+
+async function invalidateCachedAccount(id: string): Promise<void> {
+  if (!REDIS_URL) return;
+  try {
+    const client = await getRedis();
+    await client.del(redisAccountKey(id));
+  } catch (err) {
+    console.error("[accountStore] Erro ao invalidar cache de conta no Redis:", (err as Error).message);
+  }
+}
+
+// Same as getPublicAccountById, but re-reads the account first instead of
+// trusting whatever initAccountStore() cached at boot — accountsById is a
+// startup snapshot, only ever updated afterward by this process's own
+// writes (createAccount/persistAccountUpdate), so a flag (e.g. "VERIFIED")
+// added directly in Mongo — by hand, or by a future admin tool — would
+// otherwise stay invisible until the next restart. Used wherever flags
+// genuinely need to be current: the WS "register" handler (what every
+// peer's badge is decided from) and GET /auth/me (what the owning client
+// itself sees).
+//
+// A Redis cache (see above, ACCOUNT_CACHE_TTL_SECONDS) sits in front of the
+// actual MongoDB read, so a change still shows up within a bounded time
+// (60s) without hitting Mongo on every connect/rename/poll. On a cache miss
+// this also re-indexes accountsById with what it finds, so the two stay in
+// sync instead of drifting further apart. Falls back to the plain cached
+// lookup when Mongo isn't configured, *or* when the read itself fails — the
+// caller (WS "register", on every connect/rename) has no try/catch of its
+// own, so a transient Mongo hiccup must degrade to the cached value here
+// rather than reject and take the whole handler down.
 export async function refreshAccountFromMongo(id: string): Promise<PublicAccount | null> {
+  const cached = await getCachedAccount(id);
+  if (cached) return cached;
   if (!MONGO_ENABLED) return getPublicAccountById(id);
   let doc: (AccountDoc & { _id: unknown }) | null;
   try {
@@ -225,11 +310,14 @@ export async function refreshAccountFromMongo(id: string): Promise<PublicAccount
       reservedNames.delete(fold(existing.username));
       reservedNames.delete(fold(existing.displayName));
     }
+    void invalidateCachedAccount(id);
     return null;
   }
   const account = docToFullAccount(doc as unknown as AccountDoc);
   indexAccount(account);
-  return toPublicAccount(account);
+  const publicAccount = toPublicAccount(account);
+  void setCachedAccount(publicAccount);
+  return publicAccount;
 }
 
 export async function createAccount(
