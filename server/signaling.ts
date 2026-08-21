@@ -761,6 +761,10 @@ function peerSummary(info: ClientInfo) {
     // Not logged into a registered account — the client renders this as a
     // "(guest)" suffix wherever the name is shown (see lib/displayName.ts).
     isGuest: !info.accountId,
+    // Account flags (e.g. "VERIFIED") — always [] for a guest, since
+    // info.flags is only ever set alongside accountId (see the "register"
+    // handler). The client shows a badge when this includes "VERIFIED".
+    flags: info.flags ?? [],
     ...(info.isModerator ? { role: "moderator" as const } : {}),
   };
 }
@@ -1712,7 +1716,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           flushPendingSignals(info);
           broadcastToRoom(
             room,
-            { type: "peer-joined", id: info.id, name: info.name, isGuest: !info.accountId },
+            { type: "peer-joined", id: info.id, name: info.name, isGuest: !info.accountId, flags: info.flags ?? [] },
             socket
           );
           break;
@@ -1771,7 +1775,14 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           flushPendingSignals(info);
           broadcastToRoom(
             room,
-            { type: "peer-joined", id: info.id, name: info.name, isGuest: !info.accountId, role: "moderator" },
+            {
+              type: "peer-joined",
+              id: info.id,
+              name: info.name,
+              isGuest: !info.accountId,
+              flags: info.flags ?? [],
+              role: "moderator",
+            },
             socket
           );
           break;
@@ -1822,6 +1833,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               from: info.id,
               name: info.name as string,
               isGuest: !info.accountId,
+              flags: info.flags ?? [],
               kind: "gif",
               text: "",
               url,
@@ -1843,6 +1855,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               from: info.id,
               name: info.name as string,
               isGuest: !info.accountId,
+              flags: info.flags ?? [],
               text,
               ts: Date.now(),
             };

@@ -13,6 +13,10 @@ export interface ChatMessage {
   // persisted before this field existed; clients treat that the same as
   // `false` (not a guest) since it's the safer default for old data.
   isGuest?: boolean;
+  // Same capture-at-send-time reasoning as isGuest above. See
+  // signaling.ts's ClientInfo.flags — "VERIFIED" is what the client shows a
+  // badge for next to the sender's name.
+  flags?: string[];
   kind?: "text" | "gif";
   text: string;
   url?: string;
