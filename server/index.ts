@@ -20,6 +20,7 @@ import { registerSignalingRoutes } from "./signaling.js";
 import { register as metricsRegister, httpRateLimitedTotal } from "./metrics.js";
 import { initModerationStore } from "./moderationStore.js";
 import { initAccountStore } from "./accountStore.js";
+import { registerOAuthRoutes } from "./oauthRoutes.js";
 
 const PORT = Number(process.env.PORT || 4000);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -111,6 +112,12 @@ async function main() {
       return metricsRegister.metrics();
     }
   );
+
+  // Social login (see oauthRoutes.ts). Registered at the root rather than
+  // inside the signaling context below because it shares nothing with it —
+  // it only needs the account store, which initAccountStore already
+  // prepared above, and the rate limiter registered at this level.
+  await registerOAuthRoutes(app);
 
   await app.register(async (instance) => {
     await registerSignalingRoutes(instance, randomUUID);

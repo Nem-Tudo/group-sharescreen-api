@@ -22,6 +22,7 @@ import {
   createAccount,
   verifyAccountLogin,
   refreshAccountFromMongo,
+  getAccountConnections,
   isNameReserved,
   USERNAME_RE,
 } from "./accountStore.js";
@@ -47,6 +48,8 @@ import {
   loadPersistedPartnerStats,
   incrementPersistedPartnerStats,
   deletePersistedPartnerStats,
+  recordPersistedPartnerViewer,
+  loadPersistedPartnerUniqueCounts,
   type Partner,
   type PartnerConfig,
 } from "./partnerStore.js";
@@ -312,14 +315,18 @@ let partnerConfig: PartnerConfig = { partners: [], emptyPercent: 0 };
 //
 // Unlike announcementStats these are *totals*, hydrated at startup from and
 // written through to partnerStore.js, so a restart (deploy, crash) doesn't
-// zero out an advertiser's numbers mid-campaign. `views` is therefore a
-// running count rather than `viewerIds.size`: the set only dedupes the
+// zero out an advertiser's numbers mid-campaign. Both counts are therefore
+// running counts rather than a set's size: `viewerIds` only dedupes the
 // connections this process has seen since it started (a connection id can't
-// outlive the process that issued it), while the count also carries over
+// outlive the process that issued it), while the counts also carry over
 // everything counted before the last restart — see PartnerStats.
 interface PartnerStatsEntry {
+  // Connections that have already been counted as a session for this ad.
   viewerIds: Set<string>;
+  // Every serve — see the "partner-view" case.
   views: number;
+  // One per connection — see the "partner-session-view" case.
+  sessionViews: number;
   clicks: number;
 }
 const partnerStats = new Map<string, PartnerStatsEntry>();
@@ -327,7 +334,7 @@ const partnerStats = new Map<string, PartnerStatsEntry>();
 function getPartnerStats(id: string): PartnerStatsEntry {
   let entry = partnerStats.get(id);
   if (!entry) {
-    entry = { viewerIds: new Set(), views: 0, clicks: 0 };
+    entry = { viewerIds: new Set(), views: 0, sessionViews: 0, clicks: 0 };
     partnerStats.set(id, entry);
   }
   return entry;
@@ -335,7 +342,36 @@ function getPartnerStats(id: string): PartnerStatsEntry {
 
 function partnerStatsSummary(id: string) {
   const entry = partnerStats.get(id);
-  return { views: entry?.views ?? 0, clicks: entry?.clicks ?? 0 };
+  return {
+    views: entry?.views ?? 0,
+    sessionViews: entry?.sessionViews ?? 0,
+    clicks: entry?.clicks ?? 0,
+  };
+}
+
+// Who counts as one person, for the unique-viewer set.
+//
+// The account id when there is one, and the connecting IP otherwise. Both are
+// approximations and it is worth being blunt about which way each one errs: a
+// household or an office behind one NAT collapses into a single "person",
+// while the same person on wifi and then on mobile data counts twice. It is
+// the best identity this server actually has — the same one it already trusts
+// for IP bans — and it is stable across reloads and reconnects, which is the
+// property the number depends on.
+//
+// Prefixed so an account id can never collide with an IP in the same set.
+function partnerViewerKey(info: ClientInfo): string {
+  return info.accountId ? `acct:${info.accountId}` : `ip:${info.ip}`;
+}
+
+// The same summary plus the unique-viewer counts, which live in the store
+// rather than in this process (a set that restarted empty would recount every
+// returning visitor on each deploy — see partnerStore's recordPersistedPartnerViewer).
+async function partnerStatsSummaries(ids: string[]) {
+  const uniques = await loadPersistedPartnerUniqueCounts(ids);
+  return Object.fromEntries(
+    ids.map((id) => [id, { ...partnerStatsSummary(id), uniqueViews: uniques[id] ?? 0 }])
+  );
 }
 
 // Partners whose expiresAt hasn't passed yet — the only ones eligible for
@@ -949,6 +985,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     if (!persisted) continue;
     const entry = getPartnerStats(partner.id);
     entry.views = persisted.views;
+    entry.sessionViews = persisted.sessionViews;
     entry.clicks = persisted.clicks;
   }
 
@@ -1077,7 +1114,11 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     if (!payload) return reply.code(401).send({ error: "unauthorized" });
     const account = await refreshAccountFromMongo(payload.sub);
     if (!account) return reply.code(401).send({ error: "unauthorized" });
-    return { account };
+    // Which social providers this account can log in with, plus whether it
+    // has a password at all — an account created through Discord/Google
+    // doesn't (see accountStore.ts), and the client needs to know that to
+    // show the right options instead of an empty password form.
+    return { account, connections: getAccountConnections(account.id) };
   });
 
   // Full room directory for moderators — unlike /rooms, this includes
@@ -1196,8 +1237,27 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
   // brand new or reloaded page sometimes gets nothing even with partners
   // active — the live socket push (see broadcastPartnerUpdate) deliberately
   // never rolls this, only this HTTP path does.
-  app.get("/partner", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
-    const pool = activePartners();
+  app.get("/partner", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async (request) => {
+    // "current" is the ad the caller is showing right now (see PartnerCard's
+    // rotation), and it is excluded outright: when it is present this route
+    // never answers with that same id, full stop.
+    //
+    // No fallback to the whole pool when the exclusion empties it. With a
+    // single active ad that means a rotation answers empty, and the caller
+    // shows the house ad instead — which is the right outcome, not a
+    // degenerate one: the slot alternates between the advertiser and the
+    // "anuncie aqui" pitch rather than "rotating" onto the same thing it was
+    // already showing. The next rotation has no current to send (the slot is
+    // empty), so the ad comes back.
+    //
+    // Safe to take from an unauthenticated caller: the worst an arbitrary id
+    // can do is remove one ad from one request's roll.
+    const currentId = typeof (request.query as { current?: unknown })?.current === "string"
+      ? (request.query as { current: string }).current
+      : null;
+    const pool = currentId
+      ? activePartners().filter((p) => p.id !== currentId)
+      : activePartners();
     const showEmpty = partnerConfig.emptyPercent > 0 && Math.random() * 100 < partnerConfig.emptyPercent;
     const picked = showEmpty ? null : pickWeightedPartner(pool);
     return { partner: picked ? publicPartner(picked) : null };
@@ -1214,7 +1274,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     return {
       partners: partnerConfig.partners,
       emptyPercent: partnerConfig.emptyPercent,
-      stats: Object.fromEntries(partnerConfig.partners.map((p) => [p.id, partnerStatsSummary(p.id)])),
+      stats: await partnerStatsSummaries(partnerConfig.partners.map((p) => p.id)),
     };
   });
 
@@ -1231,7 +1291,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     partnerConfig = { ...partnerConfig, partners: [...partnerConfig.partners, partner] };
     await savePersistedPartnerConfig(partnerConfig);
     broadcastPartnerUpdate();
-    return { partner, stats: partnerStatsSummary(partner.id) };
+    return { partner, stats: (await partnerStatsSummaries([partner.id]))[partner.id] };
   });
 
   app.put("/admin/partners/:id", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
@@ -1255,7 +1315,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     };
     await savePersistedPartnerConfig(partnerConfig);
     broadcastPartnerUpdate();
-    return { partner: updated, stats: partnerStatsSummary(id) };
+    return { partner: updated, stats: (await partnerStatsSummaries([id]))[id] };
   });
 
   app.delete("/admin/partners/:id", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
@@ -1954,21 +2014,44 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
         // for an id that's still a real partner (expired ones stay in
         // partnerConfig.partners, see its doc comment, so this still counts
         // a view/click on one that expired moments ago while it was showing).
+        // One impression, i.e. one serve. Deliberately *not* deduped by
+        // connection: the slot refills every few minutes (see PartnerCard's
+        // rotation), and each refill that lands on this ad is another time it
+        // was actually put in front of someone. Deduping here is what the
+        // "partner-session-view" case below is for, and folding the two
+        // together is what made a single number have to mean both.
         case "partner-view": {
           const id = typeof msg.id === "string" ? msg.id : "";
           if (!partnerConfig.partners.some((p) => p.id === id)) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-view"))) return;
-          const entry = getPartnerStats(id);
-          // The dedupe happens before the counter moves, so a repeat view
-          // from the same connection never reaches the persisted total
-          // either — see PartnerStatsEntry.
-          if (entry.viewerIds.has(info.id)) break;
-          entry.viewerIds.add(info.id);
-          entry.views += 1;
+          getPartnerStats(id).views += 1;
           // Not awaited: it only writes through to Redis/disk (and logs its
           // own failures), and nothing in this handler's reply depends on
           // it — no reason to hold up the socket for the roundtrip.
           void incrementPersistedPartnerStats(id, { views: 1 });
+          // Same, for the distinct-people set. Idempotent, so re-sending it
+          // on every serve costs a set write and changes nothing.
+          void recordPersistedPartnerViewer(id, partnerViewerKey(info));
+          break;
+        }
+        // Reach: one per connection per ad, which is what "views" alone
+        // counted before the slot rotated. The client sends this separately
+        // from the impression above rather than as a flag on it, so neither
+        // count has to be inferred from the other.
+        case "partner-session-view": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          if (!partnerConfig.partners.some((p) => p.id === id)) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-session-view"))) {
+            return;
+          }
+          const entry = getPartnerStats(id);
+          // The dedupe happens before the counter moves, so a repeat from
+          // the same connection never reaches the persisted total either —
+          // see PartnerStatsEntry.
+          if (entry.viewerIds.has(info.id)) break;
+          entry.viewerIds.add(info.id);
+          entry.sessionViews += 1;
+          void incrementPersistedPartnerStats(id, { sessionViews: 1 });
           break;
         }
         case "partner-click": {

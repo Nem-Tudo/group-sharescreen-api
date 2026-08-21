@@ -4,7 +4,7 @@ import path from "node:path";
 import bcrypt from "bcryptjs";
 import { createClient } from "redis";
 import { MONGO_ENABLED, connectMongo } from "./mongo.js";
-import { AccountModel, type AccountDoc } from "./accountModels.js";
+import { AccountModel, type AccountDoc, type OAuthIdentityDoc } from "./accountModels.js";
 
 export interface PublicAccount {
   id: string;
@@ -19,8 +19,21 @@ export interface PublicAccount {
 // an HTTP response as-is; toPublicAccount() below is the only thing that's
 // ever sent to a client.
 interface FullAccount extends PublicAccount {
-  passwordHash: string;
+  // Null for an account that only ever logged in through Discord/Google —
+  // see createOAuthAccount and the guard in verifyAccountLogin.
+  passwordHash: string | null;
   ips: string[];
+  email: string | null;
+  emailVerified: boolean;
+  oauth: OAuthIdentityDoc[];
+}
+
+// One linked social identity, as the callers outside this module build it
+// (linkedAt is stamped here, not by them).
+export interface OAuthIdentityInput {
+  provider: string;
+  providerUserId: string;
+  email: string | null;
 }
 
 export const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
@@ -59,6 +72,14 @@ try {
 
 let accountsById = new Map<string, FullAccount>();
 let accountsByUsername = new Map<string, string>(); // folded username -> id
+// "<provider>:<providerUserId>" -> id. The provider's id is what a social
+// login is resolved by (never the email, which the user can change on their
+// side without it meaning anything here).
+let accountsByOAuth = new Map<string, string>();
+// folded email -> id, but only ever populated from an email a provider
+// asserted *verified* — an unverified one must not be enough to find, and
+// then claim, someone else's account (see findAccountByVerifiedEmail).
+let accountsByVerifiedEmail = new Map<string, string>();
 // A registered account's "nick" (see the register handler in signaling.ts)
 // is whichever of username/displayName someone types — both need to
 // resolve to the same owner, so this reservation map is keyed by either,
@@ -96,9 +117,18 @@ function docToFullAccount(doc: AccountDoc): FullAccount {
     flags: doc.flags,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
-    passwordHash: doc.account.passwordHash,
+    passwordHash: doc.account.passwordHash ?? null,
     ips: doc.account.ips,
+    email: doc.account.email ?? null,
+    emailVerified: doc.account.emailVerified ?? false,
+    // Accounts written before social login existed have no `oauth` field at
+    // all — treated as "no identities linked", not as a broken document.
+    oauth: doc.account.oauth ?? [],
   };
+}
+
+export function oauthIndexKey(provider: string, providerUserId: string): string {
+  return `${provider}:${providerUserId}`;
 }
 
 async function loadFromMongo(): Promise<FullAccount[]> {
@@ -115,7 +145,13 @@ async function persistNewAccount(account: FullAccount): Promise<void> {
       username: account.username,
       displayName: account.displayName,
       flags: account.flags,
-      account: { passwordHash: account.passwordHash, ips: account.ips },
+      account: {
+        passwordHash: account.passwordHash,
+        ips: account.ips,
+        email: account.email,
+        emailVerified: account.emailVerified,
+        oauth: account.oauth,
+      },
       createdAt: account.createdAt,
       updatedAt: account.updatedAt,
     });
@@ -142,11 +178,40 @@ async function persistAccountUpdate(account: FullAccount): Promise<void> {
   void invalidateCachedAccount(account.id);
 }
 
+// Sibling of persistAccountUpdate for the fields *it* deliberately doesn't
+// touch: the linked identities and the email that came with them. Kept
+// separate rather than widening that one, so the frequently-called
+// flags/ips write can't accidentally clobber an identity list it wasn't
+// given a current copy of.
+async function persistAccountIdentity(account: FullAccount): Promise<void> {
+  if (MONGO_ENABLED) {
+    await connectMongo();
+    await AccountModel.findOneAndUpdate(
+      { id: account.id },
+      {
+        "account.oauth": account.oauth,
+        "account.email": account.email,
+        "account.emailVerified": account.emailVerified,
+        updatedAt: account.updatedAt,
+      }
+    );
+  } else {
+    saveToDisk();
+  }
+  void invalidateCachedAccount(account.id);
+}
+
 function indexAccount(account: FullAccount) {
   accountsById.set(account.id, account);
   accountsByUsername.set(fold(account.username), account.id);
   reservedNames.set(fold(account.username), account.id);
   reservedNames.set(fold(account.displayName), account.id);
+  for (const identity of account.oauth) {
+    accountsByOAuth.set(oauthIndexKey(identity.provider, identity.providerUserId), account.id);
+  }
+  if (account.email && account.emailVerified) {
+    accountsByVerifiedEmail.set(fold(account.email), account.id);
+  }
 }
 
 export function toPublicAccount(account: FullAccount): PublicAccount {
@@ -167,6 +232,8 @@ export async function initAccountStore(): Promise<void> {
   const accounts = MONGO_ENABLED ? await loadFromMongo().catch(() => loadFromDisk()) : loadFromDisk();
   accountsById = new Map();
   accountsByUsername = new Map();
+  accountsByOAuth = new Map();
+  accountsByVerifiedEmail = new Map();
   reservedNames = new Map();
   for (const account of accounts) indexAccount(account);
 
@@ -309,6 +376,10 @@ export async function refreshAccountFromMongo(id: string): Promise<PublicAccount
       accountsByUsername.delete(fold(existing.username));
       reservedNames.delete(fold(existing.username));
       reservedNames.delete(fold(existing.displayName));
+      for (const identity of existing.oauth) {
+        accountsByOAuth.delete(oauthIndexKey(identity.provider, identity.providerUserId));
+      }
+      if (existing.email) accountsByVerifiedEmail.delete(fold(existing.email));
     }
     void invalidateCachedAccount(id);
     return null;
@@ -320,6 +391,21 @@ export async function refreshAccountFromMongo(id: string): Promise<PublicAccount
   return publicAccount;
 }
 
+// The name checks both creation paths (password and social) have to pass —
+// pulled out so a social signup can never end up with a username a password
+// signup would have rejected, or claim a name someone else already holds.
+function assertNamesAvailable(username: string, displayName: string) {
+  if (!USERNAME_RE.test(username)) {
+    throw new Error("Usuário inválido — use 3 a 20 letras, números ou _.");
+  }
+  if (!isValidAccountDisplayName(displayName)) {
+    throw new Error("Nome de exibição inválido.");
+  }
+  if (reservedNames.has(fold(username)) || reservedNames.has(fold(displayName))) {
+    throw new Error("Usuário ou nome de exibição já em uso.");
+  }
+}
+
 export async function createAccount(
   username: string,
   displayName: string,
@@ -327,17 +413,7 @@ export async function createAccount(
   ip: string,
   flags: string[] = []
 ): Promise<PublicAccount> {
-  if (!USERNAME_RE.test(username)) {
-    throw new Error("Usuário inválido — use 3 a 20 letras, números ou _.");
-  }
-  if (!isValidAccountDisplayName(displayName)) {
-    throw new Error("Nome de exibição inválido.");
-  }
-  const usernameKey = fold(username);
-  const displayNameKey = fold(displayName);
-  if (reservedNames.has(usernameKey) || reservedNames.has(displayNameKey)) {
-    throw new Error("Usuário ou nome de exibição já em uso.");
-  }
+  assertNamesAvailable(username, displayName);
   const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
   const now = Date.now();
   const account: FullAccount = {
@@ -349,10 +425,153 @@ export async function createAccount(
     updatedAt: now,
     passwordHash,
     ips: [ip],
+    // A password signup never asks for an email, so there's nothing to
+    // record here — an account only gets one by linking a provider.
+    email: null,
+    emailVerified: false,
+    oauth: [],
   };
   indexAccount(account);
   await persistNewAccount(account);
   return toPublicAccount(account);
+}
+
+// The social-login counterpart of createAccount: same name rules, no
+// password at all (see FullAccount.passwordHash), and the provider identity
+// stored with the account from the start, so there's never a moment where
+// one exists without the other.
+export async function createOAuthAccount(options: {
+  username: string;
+  displayName: string;
+  ip: string;
+  identity: OAuthIdentityInput;
+  emailVerified: boolean;
+}): Promise<PublicAccount> {
+  const { username, displayName, ip, identity, emailVerified } = options;
+  // Racing signups for the same provider account (double-clicked button,
+  // two tabs, a retried request) must not produce two accounts — the second
+  // one finds the first here and logs into it instead. Checked before the
+  // name validation so the loser of the race doesn't fail on its own
+  // now-taken username.
+  const existingId = findAccountIdByOAuth(identity.provider, identity.providerUserId);
+  const existing = existingId ? accountsById.get(existingId) : undefined;
+  if (existing) return toPublicAccount(existing);
+  assertNamesAvailable(username, displayName);
+  const now = Date.now();
+  const account: FullAccount = {
+    id: randomUUID(),
+    username,
+    displayName,
+    flags: [],
+    createdAt: now,
+    updatedAt: now,
+    passwordHash: null,
+    ips: [ip],
+    email: identity.email,
+    emailVerified,
+    oauth: [{ ...identity, linkedAt: now }],
+  };
+  indexAccount(account);
+  await persistNewAccount(account);
+  return toPublicAccount(account);
+}
+
+// Attaches a provider identity to an account that already exists — either
+// because a verified email matched it (see oauthRoutes.ts) or because its
+// owner asked to connect it while logged in. Idempotent: linking the same
+// identity twice is a no-op rather than a duplicate entry.
+export async function linkOAuthIdentity(
+  accountId: string,
+  identity: OAuthIdentityInput,
+  emailVerified: boolean
+): Promise<PublicAccount | null> {
+  const account = accountsById.get(accountId);
+  if (!account) return null;
+  const alreadyLinked = account.oauth.some(
+    (entry) =>
+      entry.provider === identity.provider && entry.providerUserId === identity.providerUserId
+  );
+  if (!alreadyLinked) {
+    // One account per provider: linking a second Discord replaces the first
+    // rather than leaving two entries that both resolve here, which is what
+    // someone switching their Discord account actually means.
+    account.oauth = [
+      ...account.oauth.filter((entry) => entry.provider !== identity.provider),
+      { ...identity, linkedAt: Date.now() },
+    ];
+    // Only ever *fills in* a missing email — never overwrites one already on
+    // file, so linking a provider can't quietly move an account's identity
+    // to a different address.
+    if (identity.email && emailVerified && !account.email) {
+      account.email = identity.email;
+      account.emailVerified = true;
+    }
+    account.updatedAt = Date.now();
+    indexAccount(account);
+    await persistAccountIdentity(account);
+  }
+  return toPublicAccount(account);
+}
+
+function findAccountIdByOAuth(provider: string, providerUserId: string): string | undefined {
+  return accountsByOAuth.get(oauthIndexKey(provider, providerUserId));
+}
+
+// The primary social-login lookup: an identity this deployment has seen
+// before resolves straight to its account, no email involved.
+export function findAccountByOAuthIdentity(
+  provider: string,
+  providerUserId: string
+): PublicAccount | null {
+  const id = findAccountIdByOAuth(provider, providerUserId);
+  const account = id ? accountsById.get(id) : undefined;
+  return account ? toPublicAccount(account) : null;
+}
+
+// The secondary lookup, used only on a *first* login with a given provider:
+// an account whose email some provider already asserted verified.
+// Deliberately not a plain email match — see accountsByVerifiedEmail.
+export function findAccountByVerifiedEmail(email: string): PublicAccount | null {
+  const id = accountsByVerifiedEmail.get(fold(email));
+  const account = id ? accountsById.get(id) : undefined;
+  return account ? toPublicAccount(account) : null;
+}
+
+// Detaches a provider from an account, refusing when it's the only way its
+// owner can still get in — there's no email recovery here, so an account
+// with neither a password nor a linked identity is simply lost. The caller
+// turns "last-credential" into a 409 (see oauthRoutes.ts).
+export async function unlinkOAuthProvider(
+  accountId: string,
+  provider: string
+): Promise<"ok" | "not-linked" | "last-credential"> {
+  const account = accountsById.get(accountId);
+  if (!account) return "not-linked";
+  const remaining = account.oauth.filter((entry) => entry.provider !== provider);
+  if (remaining.length === account.oauth.length) return "not-linked";
+  if (!account.passwordHash && remaining.length === 0) return "last-credential";
+  for (const entry of account.oauth) {
+    if (entry.provider === provider) {
+      accountsByOAuth.delete(oauthIndexKey(entry.provider, entry.providerUserId));
+    }
+  }
+  account.oauth = remaining;
+  account.updatedAt = Date.now();
+  await persistAccountIdentity(account);
+  return "ok";
+}
+
+// Which providers are linked, for the account's own view of itself (see GET
+// /auth/me). Provider ids only — the provider-side email isn't that
+// endpoint's business — plus whether a password exists, which is what tells
+// a client that unlinking everything would lock the owner out.
+export function getAccountConnections(id: string): { providers: string[]; hasPassword: boolean } {
+  const account = accountsById.get(id);
+  if (!account) return { providers: [], hasPassword: false };
+  return {
+    providers: account.oauth.map((entry) => entry.provider),
+    hasPassword: Boolean(account.passwordHash),
+  };
 }
 
 export async function verifyAccountLogin(
@@ -363,6 +582,10 @@ export async function verifyAccountLogin(
   const id = accountsByUsername.get(fold(username));
   const account = id ? accountsById.get(id) : undefined;
   if (!account) return null;
+  // An account created through Discord/Google has no password to compare
+  // against — bailing here (instead of letting bcrypt.compare decide) keeps
+  // that from ever becoming a login path.
+  if (!account.passwordHash) return null;
   const valid = await bcrypt.compare(password, account.passwordHash);
   if (!valid) return null;
   if (!account.ips.includes(ip)) {

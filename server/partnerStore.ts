@@ -127,13 +127,26 @@ export async function savePersistedPartnerConfig(config: PartnerConfig): Promise
 }
 
 // Accumulated engagement counters for one partner ad. Deliberately plain
-// totals rather than the id-set signaling.ts dedupes views with in memory:
+// totals rather than the id-set signaling.ts dedupes sessions with in memory:
 // that set is keyed by *connection* id, and connections never outlive a
 // restart, so there'd be nothing for a persisted set to dedupe against —
 // only the running process can dedupe its own connections, and what has to
 // survive the restart is the number it already arrived at.
+//
+// Three numbers rather than one because the slot rotates now (see
+// PartnerCard's five-minute refill), and rotation makes "a view" ambiguous.
+// None of the three can be derived from the others:
+//   - views: every serve. The same person, in the same tab, counts again
+//     each time the slot refills onto this ad.
+//   - sessionViews: one per (connection x ad). This is what "views" alone
+//     used to mean, back when a slot was filled once per page load.
+//   - unique viewers: distinct people, which is a *cardinality*, not a
+//     counter — see recordPersistedPartnerViewer below, which keeps the set
+//     rather than a running total precisely because a total cannot be
+//     deduplicated after the fact.
 export interface PartnerStats {
   views: number;
+  sessionViews: number;
   clicks: number;
 }
 
@@ -151,6 +164,12 @@ function normalizeStats(parsed: unknown): Record<string, PartnerStats> {
     const entry = value as Record<string, unknown>;
     out[id] = {
       views: typeof entry.views === "number" ? entry.views : 0,
+      // Absent in anything written before sessions were split out of views.
+      // Zero is the honest answer there: the old file genuinely holds no
+      // separate session count, and back-filling it from "views" would be
+      // inventing history — those two numbers only ever coincided for an ad
+      // that never rotated.
+      sessionViews: typeof entry.sessionViews === "number" ? entry.sessionViews : 0,
       clicks: typeof entry.clicks === "number" ? entry.clicks : 0,
     };
   }
@@ -200,8 +219,8 @@ export async function loadPersistedPartnerStats(): Promise<Record<string, Partne
       if (sep < 0) continue;
       const id = field.slice(0, sep);
       const metric = field.slice(sep + 1);
-      if (metric !== "views" && metric !== "clicks") continue;
-      const entry = out[id] ?? (out[id] = { views: 0, clicks: 0 });
+      if (metric !== "views" && metric !== "sessionViews" && metric !== "clicks") continue;
+      const entry = out[id] ?? (out[id] = { views: 0, sessionViews: 0, clicks: 0 });
       entry[metric] = Number(value) || 0;
     }
     return out;
@@ -220,12 +239,14 @@ export async function incrementPersistedPartnerStats(
   delta: Partial<PartnerStats>
 ): Promise<void> {
   const views = delta.views ?? 0;
+  const sessionViews = delta.sessionViews ?? 0;
   const clicks = delta.clicks ?? 0;
-  if (views === 0 && clicks === 0) return;
+  if (views === 0 && sessionViews === 0 && clicks === 0) return;
   if (!REDIS_URL) {
     const stats = loadStatsFromDisk();
-    const entry = stats[id] ?? (stats[id] = { views: 0, clicks: 0 });
+    const entry = stats[id] ?? (stats[id] = { views: 0, sessionViews: 0, clicks: 0 });
     entry.views += views;
+    entry.sessionViews += sessionViews;
     entry.clicks += clicks;
     saveStatsToDisk();
     return;
@@ -234,10 +255,134 @@ export async function incrementPersistedPartnerStats(
     const client = await getRedis();
     const multi = client.multi();
     if (views !== 0) multi.hIncrBy(REDIS_STATS_KEY, statsField(id, "views"), views);
+    if (sessionViews !== 0) {
+      multi.hIncrBy(REDIS_STATS_KEY, statsField(id, "sessionViews"), sessionViews);
+    }
     if (clicks !== 0) multi.hIncrBy(REDIS_STATS_KEY, statsField(id, "clicks"), clicks);
     await multi.exec();
   } catch (err) {
     console.error("[partnerStore] Erro ao salvar estatísticas no Redis:", (err as Error).message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Unique viewers
+// ---------------------------------------------------------------------------
+
+// Counting distinct people is not a counter, it is a set, and the difference
+// is not academic: an increment cannot be un-double-counted afterwards, so
+// there is no way to build this number except by remembering who has already
+// been seen. That memory has to live in the persisted store rather than in
+// the process — a per-process set would restart empty and count every
+// returning visitor again on every deploy, which is exactly the failure the
+// word "unique" promises not to have.
+//
+// Redis does the deduplication itself (SADD is a no-op for a member already
+// in the set), so nothing is loaded into this process: the sets stay in
+// Redis, one per ad, and only their cardinality is ever read back.
+const REDIS_UNIQUES_KEY_PREFIX = "sharescreen:partner-uniques:";
+
+function uniquesKey(id: string): string {
+  return REDIS_UNIQUES_KEY_PREFIX + id;
+}
+
+const PARTNER_UNIQUES_FILE_PATH = path.join(PARTNER_DATA_DIR, "partner-uniques.json");
+
+// Mirror of the uniques file for the no-Redis fallback, same shape and same
+// reasoning as diskStats above. Null until the first load.
+let diskUniques: Record<string, Set<string>> | null = null;
+
+function loadUniquesFromDisk(): Record<string, Set<string>> {
+  if (diskUniques) return diskUniques;
+  const out: Record<string, Set<string>> = {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(PARTNER_UNIQUES_FILE_PATH, "utf8")) as unknown;
+    if (parsed && typeof parsed === "object") {
+      for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (Array.isArray(value)) out[id] = new Set(value.filter((v) => typeof v === "string"));
+      }
+    }
+  } catch {
+    // No file yet, or unreadable — start empty, same as the stats fallback.
+  }
+  diskUniques = out;
+  return diskUniques;
+}
+
+function saveUniquesToDisk() {
+  try {
+    const plain: Record<string, string[]> = {};
+    for (const [id, set] of Object.entries(diskUniques ?? {})) plain[id] = [...set];
+    fs.writeFileSync(PARTNER_UNIQUES_FILE_PATH, JSON.stringify(plain));
+  } catch {
+    // Best-effort, same as the other writers here.
+  }
+}
+
+/**
+ * Remembers that this viewer has seen this ad. Idempotent by construction.
+ *
+ * The viewer key is whatever the caller considers one person — see
+ * signaling.ts's partnerViewerKey, which uses the account id when there is
+ * one and the IP otherwise, and documents what that does and does not
+ * capture.
+ *
+ * Note that the no-Redis fallback keeps every key on disk and in memory, so
+ * it grows with the audience. That is acceptable for the single-process,
+ * no-Redis setup it exists for (development, a small self-host); a
+ * deployment large enough for it to matter is a deployment with Redis, where
+ * the set never enters this process at all.
+ */
+export async function recordPersistedPartnerViewer(id: string, viewerKey: string): Promise<void> {
+  if (!id || !viewerKey) return;
+  if (!REDIS_URL) {
+    const uniques = loadUniquesFromDisk();
+    const set = uniques[id] ?? (uniques[id] = new Set());
+    if (set.has(viewerKey)) return;
+    set.add(viewerKey);
+    saveUniquesToDisk();
+    return;
+  }
+  try {
+    const client = await getRedis();
+    await client.sAdd(uniquesKey(id), viewerKey);
+  } catch (err) {
+    console.error(
+      "[partnerStore] Erro ao registrar espectador único no Redis:",
+      (err as Error).message
+    );
+  }
+}
+
+/** How many distinct viewers each of these ads has had. Unknown ids read 0. */
+export async function loadPersistedPartnerUniqueCounts(
+  ids: string[]
+): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  for (const id of ids) out[id] = 0;
+  if (ids.length === 0) return out;
+  if (!REDIS_URL) {
+    const uniques = loadUniquesFromDisk();
+    for (const id of ids) out[id] = uniques[id]?.size ?? 0;
+    return out;
+  }
+  try {
+    const client = await getRedis();
+    // One pipeline rather than a round trip per ad: the admin panel asks for
+    // every ad at once, and it is the only caller.
+    const multi = client.multi();
+    for (const id of ids) multi.sCard(uniquesKey(id));
+    const results: unknown[] = (await multi.exec()) ?? [];
+    ids.forEach((id, i) => {
+      out[id] = Number(results[i]) || 0;
+    });
+    return out;
+  } catch (err) {
+    console.error(
+      "[partnerStore] Erro ao contar espectadores únicos no Redis:",
+      (err as Error).message
+    );
+    return out;
   }
 }
 
@@ -249,11 +394,23 @@ export async function deletePersistedPartnerStats(id: string): Promise<void> {
     const stats = loadStatsFromDisk();
     delete stats[id];
     saveStatsToDisk();
+    const uniques = loadUniquesFromDisk();
+    if (uniques[id]) {
+      delete uniques[id];
+      saveUniquesToDisk();
+    }
     return;
   }
   try {
     const client = await getRedis();
-    await client.hDel(REDIS_STATS_KEY, [statsField(id, "views"), statsField(id, "clicks")]);
+    await client.hDel(REDIS_STATS_KEY, [
+      statsField(id, "views"),
+      statsField(id, "sessionViews"),
+      statsField(id, "clicks"),
+    ]);
+    // The viewer set goes with the ad. Left behind it would be the largest
+    // thing this store keeps, held for an id nothing can ever display again.
+    await client.del(uniquesKey(id));
   } catch (err) {
     console.error("[partnerStore] Erro ao apagar estatísticas do Redis:", (err as Error).message);
   }
